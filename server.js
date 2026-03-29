@@ -351,6 +351,38 @@ app.post('/check-availability', async (req, res) => {
 
 // ─── ENDPOINT 3: POST /create-booking ────────────────────────────────────────
 
+// Helper: find visible element by exact innerText and return its center coord + bottom
+async function findVisibleByText(page, text) {
+  return page.evaluate((t) => {
+    for (const el of document.querySelectorAll('*')) {
+      const txt = (el.innerText || '').trim();
+      if (txt === t) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0)
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), bottom: Math.round(r.bottom) };
+      }
+    }
+    return null;
+  }, text);
+}
+
+// Helper: select a value from a dropdown that just opened.
+// minY = minimum y-coordinate (items BELOW the spinner row).
+// nearX = if provided, only click items within ±80px of this x (keeps us in the open dropdown column).
+async function selectDropdownValue(page, value, minY = 200, nearX = null) {
+  return page.evaluate(({ v, minY, nearX }) => {
+    for (const el of document.querySelectorAll('*')) {
+      const txt = (el.innerText || '').trim();
+      if (txt === v) {
+        const r = el.getBoundingClientRect();
+        const xOk = nearX === null || (r.left + r.width / 2 >= nearX - 80 && r.left + r.width / 2 <= nearX + 80);
+        if (r.width > 0 && r.top > minY && r.top < 900 && xOk) { el.click(); return true; }
+      }
+    }
+    return false;
+  }, { v: value, minY, nearX });
+}
+
 app.post('/create-booking', async (req, res) => {
   const {
     date,
@@ -375,127 +407,408 @@ app.post('/create-booking', async (req, res) => {
   try {
     ({ page, context } = await newPage());
 
-    // Login
+    // ── Step 1: Login ────────────────────────────────────────────────────────
     await login(page);
 
-    // Go to calendar on the given date
+    // ── Step 2: Navigate to calendar and wait for SPA to load ────────────────
     console.log('[Booking] Navigating to calendar...');
-    const calendarUrl = `${CALENDAR_URL}?date=${date}`;
-    await page.goto(calendarUrl, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
-    await page.waitForTimeout(3000);
-
-    // Click the time slot
-    console.log(`[Booking] Looking for time slot: ${time}`);
-    // Try to find and click the slot by time text or data attribute
-    const slotClicked = await page.evaluate((targetTime) => {
-      // Normalize time formats (e.g. "14:00" or "2:00 PM")
-      const selectors = [
-        `[data-time="${targetTime}"]`,
-        `[data-start="${targetTime}"]`,
-        `.time-slot[title*="${targetTime}"]`,
-        `.fc-timegrid-slot[data-time]`,
-      ];
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el) { el.click(); return true; }
-      }
-      return false;
-    }, time);
-
-    if (!slotClicked) {
-      // Fallback: look for a cell containing that time and click it
-      console.log('[Booking] Direct slot click failed, trying text-based click...');
-      await page.click(`text="${time}"`, { timeout: 5000 }).catch(() => {
-        console.log('[Booking] Text click also failed, trying coordinate-based approach...');
-      });
-    }
-
+    const calReady = page.waitForResponse(
+      r => r.url().includes('/api/2/calendar/') && r.status() === 200,
+      { timeout: TIMEOUT }
+    ).catch(() => {});
+    await page.goto(CALENDAR_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
+    await calReady;
     await page.waitForTimeout(2000);
 
-    // Fill in client details — forms vary per platform; handle common patterns
-    console.log('[Booking] Filling in client details...');
+    // ── Step 3: Click the "+" FAB then "Schedule New Appointment" popup ───────
+    // The FAB is <span class="linearicon-plus">. Clicking it opens a welcome popup.
+    // Inside the popup, "Schedule New Appointment" opens the booking form.
+    console.log('[Booking] Opening new appointment form...');
+    await page.waitForSelector('.linearicon-plus', { timeout: TIMEOUT });
+    await page.click('.linearicon-plus');
+    await page.waitForTimeout(2000);
 
-    const fillField = async (selectors, value) => {
-      for (const sel of selectors) {
-        try {
-          await page.waitForSelector(sel, { timeout: 3000 });
-          await page.fill(sel, value);
-          console.log(`[Booking] Filled "${sel}" with "${value}"`);
-          return;
-        } catch (_) {}
+    // Click "Schedule New Appointment" inside the popup (find by exact innerText)
+    await page.evaluate(() => {
+      for (const el of document.querySelectorAll('*')) {
+        if ((el.innerText || '').trim() === 'Schedule New Appointment') { el.click(); return; }
       }
-      console.log(`[Booking] Could not find a field for value: "${value}"`);
-    };
+    });
+    await page.waitForSelector('input[placeholder*="Search for a client by name"]', { timeout: TIMEOUT });
+    await page.waitForTimeout(500);
+    console.log('[Booking] New appointment form opened.');
+    await screenshot(page, 'debug-booking-step1-form.png');
 
-    await fillField(
-      ['input[name*="first"], input[placeholder*="First"], input[id*="first"]'],
-      clientFirstName
-    );
-    await fillField(
-      ['input[name*="last"], input[placeholder*="Last"], input[id*="last"]'],
-      clientLastName
-    );
-    if (clientEmail) {
-      await fillField(
-        ['input[type="email"], input[name*="email"], input[placeholder*="Email"]'],
-        clientEmail
-      );
-    }
-    if (clientPhone) {
-      await fillField(
-        ['input[type="tel"], input[name*="phone"], input[placeholder*="Phone"]'],
-        clientPhone
-      );
-    }
+    // ── Step 4: Client search ─────────────────────────────────────────────────
+    // ClinicSense uses an autocomplete search — type name, select from dropdown.
+    // If not found, click "+ Add new client" and fill the new client form.
+    console.log(`[Booking] Searching for client: ${clientFirstName} ${clientLastName}`);
+    const fullName = `${clientFirstName} ${clientLastName}`;
+    await page.fill('input[placeholder*="Search for a client by name"]', fullName);
+    await page.waitForTimeout(2000);
+    await screenshot(page, 'debug-booking-step2-client-search.png');
 
-    // Select service if field exists
-    if (service) {
-      console.log(`[Booking] Selecting service: ${service}`);
-      await page.selectOption('select[name*="service"], select[id*="service"]', { label: service }).catch(() => {
-        console.log('[Booking] Service dropdown not found by standard selector, skipping...');
-      });
-    }
+    // Try to click the exact matching client name in the dropdown
+    let clientFound = false;
+    try {
+      await page.locator(`text=${fullName}`).first().click({ timeout: 5000 });
+      clientFound = true;
+      console.log('[Booking] Existing client selected.');
+    } catch (_) {}
 
-    // Select therapist if field exists
-    if (therapist) {
-      console.log(`[Booking] Selecting therapist: ${therapist}`);
-      await page.selectOption('select[name*="therapist"], select[id*="therapist"], select[name*="practitioner"]', { label: therapist }).catch(() => {
-        console.log('[Booking] Therapist dropdown not found, skipping...');
-      });
-    }
+    if (!clientFound) {
+      // Client not in system — click "+ Add new client"
+      console.log('[Booking] Client not found — adding new client...');
+      const addLink = await findVisibleByText(page, '+ Add new client');
+      if (addLink) {
+        await page.mouse.click(addLink.x, addLink.y);
+        await page.waitForTimeout(2000);
+        await screenshot(page, 'debug-booking-step3-new-client.png');
 
-    // Select duration if field exists
-    if (duration) {
-      console.log(`[Booking] Selecting duration: ${duration}`);
-      await page.selectOption('select[name*="duration"], select[id*="duration"]', { label: duration }).catch(async () => {
-        await page.selectOption('select[name*="duration"], select[id*="duration"]', { value: duration }).catch(() => {
-          console.log('[Booking] Duration dropdown not found, skipping...');
+        // The new client form appears — fill first/last name, email, phone
+        // ClinicSense new client form uses placeholder-based inputs
+        const fieldMap = [
+          ['input[placeholder*="First" i]',  clientFirstName],
+          ['input[placeholder*="Last" i]',   clientLastName],
+          ['input[placeholder*="email" i], input[type="email"]', clientEmail || ''],
+          ['input[placeholder*="phone" i], input[type="tel"]',   clientPhone || ''],
+        ];
+        for (const [sel, val] of fieldMap) {
+          if (!val) continue;
+          const el = await page.$(sel);
+          if (el) { await el.fill(val); console.log(`[Booking] New client field filled: ${val}`); }
+        }
+
+        // Save the new client (look for a "Save" / "Add" button in the client section)
+        await page.evaluate(() => {
+          for (const el of document.querySelectorAll('button, [role="button"]')) {
+            const txt = (el.innerText || '').trim().toLowerCase();
+            if (txt === 'save' || txt === 'add client' || txt === 'add') { el.click(); return; }
+          }
         });
-      });
+        await page.waitForTimeout(2000);
+      } else {
+        console.log('[Booking] "+ Add new client" link not found, continuing...');
+      }
     }
 
-    // Save the appointment
-    console.log('[Booking] Saving appointment...');
-    await page.click(
-      'button[type="submit"], button:has-text("Save"), button:has-text("Book"), button:has-text("Create"), button:has-text("Confirm")',
-      { timeout: TIMEOUT }
-    );
+    await screenshot(page, 'debug-booking-step4-after-client.png');
 
-    await page.waitForTimeout(3000);
+    // ── Step 5: Select service (custom Vue dropdown) ──────────────────────────
+    // The service dropdown shows a list of services, each with duration buttons
+    // (60 MIN, 90 MIN, 120 MIN). Click the service name row, then the duration.
+    if (service) {
+      console.log(`[Booking] Selecting service: ${service} (${duration || '60'} min)`);
 
-    // Take screenshot
+      // Find and click the "Select service" dropdown
+      const svcDropdown = await findVisibleByText(page, 'Select service');
+      if (svcDropdown) {
+        await page.mouse.click(svcDropdown.x, svcDropdown.y);
+        await page.waitForTimeout(1500);
+        await screenshot(page, 'debug-booking-step5-service-open.png');
+
+        // Find service by partial name match, then click its duration button
+        const svcClicked = await page.evaluate(({ svcName, dur }) => {
+          const allEls = [...document.querySelectorAll('*')];
+          // Find the service name element (partial match, short text, no newlines)
+          let serviceEl = null;
+          for (const el of allEls) {
+            const txt = (el.innerText || '').trim().toLowerCase();
+            if (txt.includes(svcName.toLowerCase()) && !txt.includes('\n') && txt.length < 80 && el.children.length <= 2) {
+              const r = el.getBoundingClientRect();
+              if (r.width > 100 && r.height > 0) { serviceEl = { el, y: r.top }; break; }
+            }
+          }
+          if (!serviceEl) return { error: `Service "${svcName}" not found` };
+
+          // Find the duration button (e.g. "60 MIN") closest BELOW the service name
+          const durText = dur + ' MIN';
+          let closestBtn = null, closestDist = Infinity;
+          for (const el of allEls) {
+            if ((el.innerText || '').trim() === durText) {
+              const r = el.getBoundingClientRect();
+              if (r.top > serviceEl.y && r.top < serviceEl.y + 100 && r.width > 20) {
+                const dist = r.top - serviceEl.y;
+                if (dist < closestDist) { closestDist = dist; closestBtn = el; }
+              }
+            }
+          }
+          if (!closestBtn) {
+            // Fallback: just click first visible duration button below service
+            for (const el of allEls) {
+              const r = el.getBoundingClientRect();
+              if (r.top > serviceEl.y && r.top < serviceEl.y + 120 && r.width > 20 && r.height > 0) {
+                const txt = (el.innerText || '').trim();
+                if (/^\d+ MIN$/.test(txt)) { closestBtn = el; break; }
+              }
+            }
+          }
+          if (closestBtn) { closestBtn.click(); return { success: true }; }
+          return { error: `Duration "${durText}" not found below service` };
+        }, { svcName: service, dur: String(duration || '60') });
+
+        console.log('[Booking] Service click result:', JSON.stringify(svcClicked));
+        await page.waitForTimeout(1500);
+        await screenshot(page, 'debug-booking-step5-after-service.png');
+      }
+    }
+
+    // ── Step 6: Select practitioner ───────────────────────────────────────────
+    // Custom dropdown — click to open, then find the practitioner name in the
+    // list (which appears below the dropdown button). Filter by: no newlines in
+    // the text (excludes calendar headers), text matches therapist name.
+    if (therapist) {
+      console.log(`[Booking] Selecting practitioner: ${therapist}`);
+
+      const pracDropdown = await findVisibleByText(page, 'Select practitioner');
+      if (pracDropdown) {
+        await page.mouse.click(pracDropdown.x, pracDropdown.y);
+        await page.waitForTimeout(1500);
+        await screenshot(page, 'debug-booking-step6-prac-open.png');
+
+        // Find practitioner in the dropdown list (below the dropdown, no newlines)
+        const pracClicked = await page.evaluate(({ dropY, name }) => {
+          for (const el of document.querySelectorAll('*')) {
+            const txt = (el.innerText || '').trim();
+            if (
+              txt.toLowerCase().includes(name.toLowerCase()) &&
+              !txt.includes('\n') &&
+              txt.length < 80
+            ) {
+              const r = el.getBoundingClientRect();
+              if (r.top > dropY && r.width > 50 && r.height > 0) {
+                el.click();
+                return { clicked: txt };
+              }
+            }
+          }
+          return { error: `Practitioner "${name}" not found in dropdown` };
+        }, { dropY: pracDropdown.bottom, name: therapist });
+
+        console.log('[Booking] Practitioner click result:', JSON.stringify(pracClicked));
+        await page.waitForTimeout(1500);
+        await screenshot(page, 'debug-booking-step6-after-prac.png');
+      }
+    }
+
+    // ── Step 7: Set date ──────────────────────────────────────────────────────
+    // The date field shows the current date as pre-filled text.
+    // Clicking the INPUT element opens a calendar picker overlay.
+    // Use page.mouse.click() to bypass BOX-flex-manager pointer intercepts.
+    console.log(`[Booking] Setting date to: ${date}`);
+    const targetDay = parseInt(date.split('-')[2], 10);
+
+    // Get the date input's actual position
+    const dateInputPos = await page.evaluate(() => {
+      const input = document.querySelector('input[placeholder*="Select a date"]');
+      const r = input?.getBoundingClientRect();
+      return r ? { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), bottom: Math.round(r.bottom) } : null;
+    });
+
+    if (dateInputPos) {
+      await page.mouse.click(dateInputPos.x, dateInputPos.y);
+      await page.waitForTimeout(1200);
+      await screenshot(page, 'debug-booking-step7-datepicker.png');
+
+      // Click the target day in the calendar picker.
+      // Strategy: find the calendar picker container first by locating the month/year
+      // header text (e.g. "March 2026"), then search for the day number WITHIN it.
+      // This avoids matching "29" from other page elements (appointments, time grid, etc.)
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const dayClicked = await page.evaluate(({ day, inputBottom, inputRight }) => {
+          // Step 1: find the month header element visible in the picker area
+          // (something like "March 2026" positioned below the date input)
+          let pickerRoot = null;
+          for (const el of document.querySelectorAll('*')) {
+            const txt = (el.innerText || '').trim();
+            const r = el.getBoundingClientRect();
+            if (/^[A-Za-z]+ \d{4}$/.test(txt) && r.top > inputBottom - 60 && r.top < inputBottom + 200) {
+              // Walk up to find the calendar container (a reasonably-sized ancestor)
+              let ancestor = el.parentElement;
+              for (let i = 0; i < 8 && ancestor; i++) {
+                const ar = ancestor.getBoundingClientRect();
+                if (ar.width > 100 && ar.height > 100) { pickerRoot = ancestor; break; }
+                ancestor = ancestor.parentElement;
+              }
+              if (!pickerRoot) pickerRoot = el.parentElement;
+              break;
+            }
+          }
+
+          // Step 2: search for the day number within the picker, or fallback to
+          // small-cell elements below the date input
+          const searchRoot = pickerRoot || document;
+          const candidates = [...searchRoot.querySelectorAll('*')];
+          for (const el of candidates) {
+            const txt = (el.innerText || '').trim();
+            if (txt !== String(day)) continue;
+            const r = el.getBoundingClientRect();
+            // The day cell should be small (25-60px), below the input, and near the picker x range
+            if (
+              r.top > inputBottom - 10 &&
+              r.width >= 20 && r.width <= 70 &&
+              r.height >= 18 && r.height <= 70 &&
+              r.left >= 0 && r.left <= 1280
+            ) {
+              el.click();
+              return { x: Math.round(r.left), y: Math.round(r.top), inPicker: !!pickerRoot };
+            }
+          }
+          return null;
+        }, { day: targetDay, inputBottom: dateInputPos.bottom, inputRight: dateInputPos.x + 140 });
+
+        if (dayClicked) {
+          console.log(`[Booking] Day ${targetDay} clicked at:`, JSON.stringify(dayClicked));
+          break;
+        }
+
+        // Navigate to next month if day not visible
+        const nextClicked = await page.evaluate(({ inputBottom }) => {
+          for (const el of document.querySelectorAll('*')) {
+            const txt = (el.innerText || '').trim();
+            const r = el.getBoundingClientRect();
+            if ((txt === '›' || txt === '>') && r.top > inputBottom - 30) { el.click(); return true; }
+          }
+          return false;
+        }, { inputBottom: dateInputPos.bottom });
+
+        if (!nextClicked) break;
+        await page.waitForTimeout(500);
+      }
+      await page.waitForTimeout(1000);
+      // Press Escape to close the date picker overlay if still open,
+      // then click a neutral spot so no dropdown remains open before step 8.
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(400);
+    }
+
+    await screenshot(page, 'debug-booking-step7-after-date.png');
+
+    // ── Step 8: Set start time ─────────────────────────────────────────────────
+    // ClinicSense uses 3 custom spinner dropdowns: Hour / Minute / AM-PM.
+    // Each spinner opens a dropdown when clicked via page.mouse.click().
+    // Minute options are quarter-hour: 00, 15, 30, 45.
+    console.log(`[Booking] Setting start time: ${time}`);
+    const timeMatch = time.match(/(\d{1,2}):(\d{2})\s?(AM|PM)/i);
+    if (timeMatch) {
+      const tHour  = String(parseInt(timeMatch[1], 10)); // "02" → "2"
+      const tAmpm  = timeMatch[3].toUpperCase();
+      // Round minute to nearest quarter-hour option
+      const rawMin   = parseInt(timeMatch[2], 10);
+      const minOpts  = [0, 15, 30, 45];
+      const rounded  = minOpts.reduce((a, b) => Math.abs(b - rawMin) < Math.abs(a - rawMin) ? b : a);
+      const tMin     = String(rounded).padStart(2, '0');
+
+      console.log(`[Booking] Parsed time → hour=${tHour}, min=${tMin}, ampm=${tAmpm}`);
+
+      // Find the 3 start-time spinners within the [data-cs_field_name="start_time"] container.
+      // Filter for BOX-flex-manager divs with width 60-85px, cluster by x separation > 50px.
+      const spinnerCoords = await page.evaluate(() => {
+        const container = document.querySelector('[data-cs_field_name="start_time"]');
+        if (!container) return [];
+        const cr = container.getBoundingClientRect();
+        const candidates = [...container.querySelectorAll('.BOX-flex-manager')].filter(el => {
+          const r = el.getBoundingClientRect();
+          return r.width >= 60 && r.width <= 90 && r.height >= 25 && r.height <= 55 && r.top > cr.top + 5;
+        });
+        // Get all left-edge x values, sort ascending
+        const xVals = candidates
+          .map(el => Math.round(el.getBoundingClientRect().left))
+          .sort((a, b) => a - b);
+        // Cluster: only keep values that are >50px apart from the previous kept value
+        const clusters = [];
+        for (const x of xVals) {
+          if (clusters.length === 0 || x - clusters[clusters.length - 1] > 50) clusters.push(x);
+          if (clusters.length === 3) break;
+        }
+        return clusters.map(x => {
+          const el = candidates.find(e => Math.abs(Math.round(e.getBoundingClientRect().left) - x) <= 5);
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        }).filter(Boolean);
+      });
+
+      console.log('[Booking] Start time spinner coords:', JSON.stringify(spinnerCoords));
+
+      if (spinnerCoords.length >= 3) {
+        const [hourSpinner, minSpinner, ampmSpinner] = spinnerCoords;
+
+        // ── Hour ──────────────────────────────────────────────────────────────
+        await page.mouse.click(hourSpinner.x, hourSpinner.y);
+        await page.waitForTimeout(800);
+        const hourOk = await selectDropdownValue(page, tHour, hourSpinner.y + 20, hourSpinner.x);
+        console.log(`[Booking] Hour ${tHour} selected:`, hourOk);
+        await page.waitForTimeout(500);
+
+        // ── Minute ────────────────────────────────────────────────────────────
+        await page.mouse.click(minSpinner.x, minSpinner.y);
+        await page.waitForTimeout(800);
+        const minOk = await selectDropdownValue(page, tMin, minSpinner.y + 20, minSpinner.x);
+        console.log(`[Booking] Minute ${tMin} selected:`, minOk);
+        await page.waitForTimeout(500);
+
+        // ── AM/PM ─────────────────────────────────────────────────────────────
+        await page.mouse.click(ampmSpinner.x, ampmSpinner.y);
+        await page.waitForTimeout(800);
+        const ampmOk = await selectDropdownValue(page, tAmpm, ampmSpinner.y + 20, ampmSpinner.x);
+        console.log(`[Booking] AM/PM ${tAmpm} selected:`, ampmOk);
+        await page.waitForTimeout(500);
+      } else {
+        console.log(`[Booking] WARNING: only ${spinnerCoords.length} spinners found (expected 3)`);
+      }
+    }
+
+    await page.waitForTimeout(1000);
+    await screenshot(page, 'debug-booking-step8-before-save.png');
+
+    // ── Step 9: Save & Close ──────────────────────────────────────────────────
+    // The SAVE & CLOSE button is at the bottom of the modal (y > 800).
+    // Use mouse.click to bypass BOX-flex-manager pointer intercepts.
+    console.log('[Booking] Clicking SAVE & CLOSE...');
+    const saveCoord = await page.evaluate(() => {
+      for (const el of document.querySelectorAll('*')) {
+        if ((el.innerText || '').trim() === 'SAVE & CLOSE') {
+          const r = el.getBoundingClientRect();
+          if (r.bottom > 800 && r.width > 50)
+            return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        }
+      }
+      return null;
+    });
+
+    if (saveCoord) {
+      await page.mouse.click(saveCoord.x, saveCoord.y);
+    } else {
+      // Fallback: try Playwright locator
+      await page.locator('text=SAVE & CLOSE').last().click({ timeout: TIMEOUT });
+    }
+
+    await page.waitForTimeout(4000);
     await screenshot(page, 'debug-booking.png');
 
-    console.log('[Booking] Booking complete!');
+    // Verify success: the modal should have closed (check for it)
+    const modalStillOpen = await page.$('input[placeholder*="Search for a client by name"]');
+    if (modalStillOpen) {
+      // Modal still open — check for error messages
+      const errorText = await page.evaluate(() => {
+        for (const el of document.querySelectorAll('*')) {
+          const txt = (el.innerText || '').trim();
+          if (txt.includes('required') || txt.includes('error') || txt.includes('Error')) {
+            if (txt.length < 200) return txt;
+          }
+        }
+        return null;
+      });
+      if (errorText) throw new Error(`Form validation error: ${errorText}`);
+      // If no error but modal open, maybe it saved successfully as a draft
+    }
 
+    console.log('[Booking] Booking complete!');
     res.json({
       success: true,
       message: 'Appointment booked successfully',
-      details: {
-        date,
-        time,
-        client: `${clientFirstName} ${clientLastName}`,
-      },
+      details: { date, time, client: `${clientFirstName} ${clientLastName}` },
     });
   } catch (err) {
     console.error('[Booking] ERROR:', err.message);
@@ -507,6 +820,14 @@ app.post('/create-booking', async (req, res) => {
 });
 
 // ─── ENDPOINT 4: POST /cancel-booking ────────────────────────────────────────
+// Cancels an appointment by navigating to the target date in the calendar,
+// clicking the appointment block to open its edit form, then clicking
+// "CANCEL APPOINTMENT" → "CONFIRM CANCELLATION".
+//
+// Required body: { date, time, clientName }
+//   date       – "YYYY-MM-DD"
+//   time       – "H:MM AM/PM"  (used to match the appointment when clientName is ambiguous)
+//   clientName – partial or full client name (case-insensitive)
 
 app.post('/cancel-booking', async (req, res) => {
   const { date, time, clientName } = req.body;
@@ -520,66 +841,152 @@ app.post('/cancel-booking', async (req, res) => {
 
   try {
     ({ page, context } = await newPage());
-
-    // Login
     await login(page);
 
-    // Go to calendar on the given date
-    console.log('[Cancel] Navigating to calendar...');
-    const calendarUrl = `${CALENDAR_URL}?date=${date}`;
-    await page.goto(calendarUrl, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
-    await page.waitForTimeout(3000);
-
-    // Find and click the appointment
-    console.log(`[Cancel] Looking for appointment at ${time}${clientName ? ` for ${clientName}` : ''}...`);
-    let appointmentClicked = false;
-
-    // Try to click by client name first
-    if (clientName) {
-      appointmentClicked = await page.click(`text="${clientName}"`, { timeout: 5000 })
-        .then(() => true)
-        .catch(() => false);
-    }
-
-    // Fallback: click by time
-    if (!appointmentClicked) {
-      appointmentClicked = await page.click(`[data-time="${time}"] .appointment, [data-start="${time}"]`, { timeout: 5000 })
-        .then(() => true)
-        .catch(() => false);
-    }
-
-    if (!appointmentClicked) {
-      console.log('[Cancel] Could not find appointment by name or time, checking page content...');
-    }
-
+    // ── Step 1: Load today's calendar (wait for SPA + API) ─────────────────
+    console.log('[Cancel] Loading calendar...');
+    const calApiDone = page.waitForResponse(
+      r => r.url().includes('/api/2/calendar/') && r.status() === 200,
+      { timeout: TIMEOUT }
+    ).catch(() => {});
+    await page.goto(CALENDAR_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
+    await calApiDone;
     await page.waitForTimeout(2000);
 
-    // Find and click the Cancel button in the popup/modal
-    console.log('[Cancel] Looking for Cancel button...');
-    await page.click(
-      'button:has-text("Cancel"), button:has-text("Cancel Appointment"), a:has-text("Cancel"), [class*="cancel"]',
-      { timeout: TIMEOUT }
-    );
+    // ── Step 2: Navigate to target date ────────────────────────────────────
+    // Calculate days difference between today and the target date.
+    // Use the "previous/next day" chevron icons in the calendar header.
+    const todayStr = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+    const [ty, tm, td] = todayStr.split('-').map(Number);
+    const [gy, gm, gd] = date.split('-').map(Number);
+    const todayMs  = Date.UTC(ty, tm - 1, td);
+    const targetMs = Date.UTC(gy, gm - 1, gd);
+    const daysDiff = Math.round((targetMs - todayMs) / 86400000);
 
-    await page.waitForTimeout(1000);
+    console.log(`[Cancel] Today: ${todayStr}, target: ${date}, diff: ${daysDiff} days`);
 
-    // Confirm cancellation if a confirmation dialog appears
-    console.log('[Cancel] Looking for confirmation dialog...');
-    await page.click(
-      'button:has-text("Yes"), button:has-text("Confirm"), button:has-text("OK"), button:has-text("Yes, Cancel")',
-      { timeout: 5000 }
-    ).catch(() => {
-      console.log('[Cancel] No confirmation dialog found, continuing...');
+    if (daysDiff !== 0) {
+      const arrowCls = daysDiff > 0
+        ? '.linearicon-chevron-right-circle'   // forward in time
+        : '.linearicon-chevron-left-circle';   // backward in time
+      const steps = Math.abs(daysDiff);
+
+      for (let i = 0; i < steps; i++) {
+        const calNext = page.waitForResponse(
+          r => r.url().includes('/api/2/calendar/') && r.status() === 200,
+          { timeout: 15000 }
+        ).catch(() => {});
+        await page.evaluate((cls) => {
+          const el = document.querySelector(cls);
+          if (el) el.click();
+        }, arrowCls);
+        await calNext;
+        await page.waitForTimeout(600);
+      }
+    }
+    await page.waitForTimeout(1500);
+    console.log(`[Cancel] Navigated to ${date}`);
+    await screenshot(page, 'debug-cancel-step1-date.png');
+
+    // ── Step 3: Use API to find the appointment ─────────────────────────────
+    // Identify the appointment we need to cancel by client name + time.
+    const apptInfo = await page.evaluate(async ({ targetDate, clientNameQ, timeStr }) => {
+      const resp = await fetch(`/api/2/calendar/?mode=day&exact_date=${targetDate}&format=json`, { credentials: 'include' });
+      const data  = await resp.json();
+      const appts = data.appointments || [];
+
+      // Convert "H:MM AM/PM" → "HH:MM:SS" for comparison
+      const toH24 = (t) => {
+        const m = t.match(/(\d{1,2}):(\d{2})\s?(AM|PM)/i);
+        if (!m) return null;
+        let h = parseInt(m[1]); const min = parseInt(m[2]); const ap = m[3].toUpperCase();
+        if (ap === 'AM' && h === 12) h = 0;
+        if (ap === 'PM' && h !== 12) h += 12;
+        return `${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
+      };
+      const target24 = toH24(timeStr);
+
+      // Match by client name (partial, case-insensitive) and start_time
+      for (const a of appts) {
+        const nameMatch = !clientNameQ || (a.client_name || '').toLowerCase().includes(clientNameQ.toLowerCase());
+        const timeMatch = !target24  || (a.start_time || '').startsWith(target24.slice(0, 5));
+        if (nameMatch && timeMatch) return { id: a.id, name: a.client_name, start: a.start_time };
+      }
+      // Fallback: match by name only
+      for (const a of appts) {
+        if (!clientNameQ) return { id: a.id, name: a.client_name, start: a.start_time };
+        if ((a.client_name || '').toLowerCase().includes(clientNameQ.toLowerCase()))
+          return { id: a.id, name: a.client_name, start: a.start_time };
+      }
+      return null;
+    }, { targetDate: date, clientNameQ: clientName || '', timeStr: time });
+
+    if (!apptInfo) {
+      throw new Error(`No appointment found on ${date} for "${clientName}" at ${time}`);
+    }
+    console.log(`[Cancel] Found appointment #${apptInfo.id} for ${apptInfo.name} at ${apptInfo.start}`);
+
+    // ── Step 4: Click the appointment block in the calendar ─────────────────
+    // .calendar-event elements contain the appointment card. We match by client name.
+    const clickedAppt = await page.evaluate(({ name }) => {
+      for (const el of document.querySelectorAll('.calendar-event, .calendar-appointment')) {
+        const txt = (el.innerText || '').toLowerCase();
+        if (txt.includes(name.toLowerCase())) {
+          el.scrollIntoView({ behavior: 'auto', block: 'center' });
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    }, { name: apptInfo.name });
+
+    if (!clickedAppt) {
+      throw new Error(`Could not click appointment for "${apptInfo.name}" in the calendar view`);
+    }
+
+    await page.waitForTimeout(2500);
+    await screenshot(page, 'debug-cancel-step2-form.png');
+    console.log('[Cancel] Appointment edit form opened');
+
+    // ── Step 5: Click "CANCEL APPOINTMENT" button ───────────────────────────
+    const cancelBtnClicked = await page.evaluate(() => {
+      for (const el of document.querySelectorAll('*')) {
+        if ((el.innerText || '').trim() === 'CANCEL APPOINTMENT') {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) { el.click(); return true; }
+        }
+      }
+      return false;
     });
 
-    await page.waitForTimeout(2000);
+    if (!cancelBtnClicked) {
+      throw new Error('"CANCEL APPOINTMENT" button not found in the edit form');
+    }
 
-    // Take screenshot
+    await page.waitForTimeout(1500);
+    await screenshot(page, 'debug-cancel-step3-dialog.png');
+    console.log('[Cancel] Cancellation dialog opened');
+
+    // ── Step 6: Click "CONFIRM CANCELLATION" ───────────────────────────────
+    const confirmClicked = await page.evaluate(() => {
+      for (const el of document.querySelectorAll('*')) {
+        if ((el.innerText || '').trim() === 'CONFIRM CANCELLATION') {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) { el.click(); return true; }
+        }
+      }
+      return false;
+    });
+
+    if (!confirmClicked) {
+      throw new Error('"CONFIRM CANCELLATION" button not found in the dialog');
+    }
+
+    await page.waitForTimeout(3000);
     await screenshot(page, 'debug-cancel.png');
+    console.log('[Cancel] Cancellation confirmed!');
 
-    console.log('[Cancel] Cancellation complete!');
-
-    res.json({ success: true, message: 'Appointment cancelled' });
+    res.json({ success: true, message: 'Appointment cancelled', details: { date, time, client: clientName } });
   } catch (err) {
     console.error('[Cancel] ERROR:', err.message);
     if (page) await screenshot(page, 'debug-cancel.png').catch(() => {});
@@ -590,6 +997,13 @@ app.post('/cancel-booking', async (req, res) => {
 });
 
 // ─── ENDPOINT 5: POST /reschedule-booking ────────────────────────────────────
+// Opens the existing appointment's edit form and changes the date + time,
+// then saves. Reuses the same date-picker and time-spinner logic as create-booking.
+//
+// Required body: { oldDate, oldTime, newDate, newTime, clientName }
+//   oldDate/oldTime – identify the appointment to move
+//   newDate/newTime – new date/time ("YYYY-MM-DD" / "H:MM AM/PM")
+//   clientName      – partial client name for matching
 
 app.post('/reschedule-booking', async (req, res) => {
   const { oldDate, oldTime, newDate, newTime, clientName } = req.body;
@@ -601,89 +1015,258 @@ app.post('/reschedule-booking', async (req, res) => {
     });
   }
 
-  console.log(`\n[Reschedule] Moving appointment from ${oldDate} ${oldTime} to ${newDate} ${newTime}`);
+  console.log(`\n[Reschedule] Moving ${clientName || 'appointment'} from ${oldDate} ${oldTime} → ${newDate} ${newTime}`);
   let context, page;
 
   try {
     ({ page, context } = await newPage());
-
-    // Login
     await login(page);
 
-    // Go to calendar on the old date
-    console.log('[Reschedule] Navigating to original appointment date...');
-    const calendarUrl = `${CALENDAR_URL}?date=${oldDate}`;
-    await page.goto(calendarUrl, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
-    await page.waitForTimeout(3000);
-
-    // Find and click the existing appointment
-    console.log(`[Reschedule] Looking for appointment at ${oldTime}${clientName ? ` for ${clientName}` : ''}...`);
-    let appointmentClicked = false;
-
-    if (clientName) {
-      appointmentClicked = await page.click(`text="${clientName}"`, { timeout: 5000 })
-        .then(() => true)
-        .catch(() => false);
-    }
-
-    if (!appointmentClicked) {
-      appointmentClicked = await page.click(`[data-time="${oldTime}"] .appointment, [data-start="${oldTime}"]`, { timeout: 5000 })
-        .then(() => true)
-        .catch(() => false);
-    }
-
-    await page.waitForTimeout(2000);
-
-    // Look for a Reschedule or Edit button
-    console.log('[Reschedule] Looking for Reschedule/Edit button...');
-    await page.click(
-      'button:has-text("Reschedule"), button:has-text("Edit"), button:has-text("Move"), a:has-text("Reschedule"), a:has-text("Edit")',
+    // ── Step 1: Load calendar and navigate to oldDate ──────────────────────
+    console.log('[Reschedule] Loading calendar...');
+    const calApiDone = page.waitForResponse(
+      r => r.url().includes('/api/2/calendar/') && r.status() === 200,
       { timeout: TIMEOUT }
-    );
-
+    ).catch(() => {});
+    await page.goto(CALENDAR_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
+    await calApiDone;
     await page.waitForTimeout(2000);
 
-    // Update the date field
-    console.log(`[Reschedule] Setting new date: ${newDate}`);
-    await page.fill(
-      'input[type="date"], input[name*="date"], input[placeholder*="date"], input[id*="date"]',
-      newDate
-    ).catch(() => {
-      console.log('[Reschedule] Could not fill date field directly...');
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const msPerDay = 86400000;
+    const toDays = (s) => { const [y,m,d] = s.split('-').map(Number); return Date.UTC(y,m-1,d) / msPerDay; };
+    const daysDiff = Math.round(toDays(oldDate) - toDays(todayStr));
+
+    if (daysDiff !== 0) {
+      const arrowCls = daysDiff > 0 ? '.linearicon-chevron-right-circle' : '.linearicon-chevron-left-circle';
+      for (let i = 0; i < Math.abs(daysDiff); i++) {
+        const calNext = page.waitForResponse(
+          r => r.url().includes('/api/2/calendar/') && r.status() === 200, { timeout: 15000 }
+        ).catch(() => {});
+        await page.evaluate((cls) => { document.querySelector(cls)?.click(); }, arrowCls);
+        await calNext;
+        await page.waitForTimeout(600);
+      }
+    }
+    await page.waitForTimeout(1500);
+    console.log(`[Reschedule] On ${oldDate}`);
+
+    // ── Step 2: Find appointment via API ────────────────────────────────────
+    const apptInfo = await page.evaluate(async ({ targetDate, clientNameQ, timeStr }) => {
+      const resp = await fetch(`/api/2/calendar/?mode=day&exact_date=${targetDate}&format=json`, { credentials: 'include' });
+      const data  = await resp.json();
+      const appts = data.appointments || [];
+      const toH24 = (t) => {
+        const m = t.match(/(\d{1,2}):(\d{2})\s?(AM|PM)/i);
+        if (!m) return null;
+        let h = parseInt(m[1]); const min = parseInt(m[2]); const ap = m[3].toUpperCase();
+        if (ap === 'AM' && h === 12) h = 0;
+        if (ap === 'PM' && h !== 12) h += 12;
+        return `${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}`;
+      };
+      const target24 = toH24(timeStr);
+      for (const a of appts) {
+        const nameOk = !clientNameQ || (a.client_name || '').toLowerCase().includes(clientNameQ.toLowerCase());
+        const timeOk = !target24   || (a.start_time || '').startsWith(target24);
+        if (nameOk && timeOk) return { id: a.id, name: a.client_name, start: a.start_time };
+      }
+      for (const a of appts) {
+        if (!clientNameQ || (a.client_name || '').toLowerCase().includes(clientNameQ.toLowerCase()))
+          return { id: a.id, name: a.client_name, start: a.start_time };
+      }
+      return null;
+    }, { targetDate: oldDate, clientNameQ: clientName || '', timeStr: oldTime });
+
+    if (!apptInfo) throw new Error(`No appointment found on ${oldDate} for "${clientName}" at ${oldTime}`);
+    console.log(`[Reschedule] Found appointment #${apptInfo.id} for ${apptInfo.name}`);
+
+    // ── Step 3: Click the appointment in calendar to open edit form ─────────
+    const clickedAppt = await page.evaluate(({ name }) => {
+      for (const el of document.querySelectorAll('.calendar-event, .calendar-appointment')) {
+        if ((el.innerText || '').toLowerCase().includes(name.toLowerCase())) {
+          el.scrollIntoView({ behavior: 'auto', block: 'center' });
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    }, { name: apptInfo.name });
+
+    if (!clickedAppt) throw new Error(`Could not click appointment for "${apptInfo.name}" in calendar`);
+    await page.waitForTimeout(2500);
+    await screenshot(page, 'debug-reschedule-step1-form.png');
+    console.log('[Reschedule] Edit form opened');
+
+    // ── Step 4: Change the date ─────────────────────────────────────────────
+    const targetDay = parseInt(newDate.split('-')[2], 10);
+    console.log(`[Reschedule] Setting new date: ${newDate} (day ${targetDay})`);
+
+    const dateInputPos = await page.evaluate(() => {
+      const input = document.querySelector('input[placeholder*="Select a date"]');
+      const r = input?.getBoundingClientRect();
+      return r ? { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), bottom: Math.round(r.bottom) } : null;
     });
 
-    // Update the time field
+    if (dateInputPos) {
+      await page.mouse.click(dateInputPos.x, dateInputPos.y);
+      await page.waitForTimeout(1200);
+
+      // Navigate calendar months if needed then click target day
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const dayClicked = await page.evaluate(({ day, inputBottom }) => {
+          let pickerRoot = null;
+          for (const el of document.querySelectorAll('*')) {
+            const txt = (el.innerText || '').trim();
+            const r   = el.getBoundingClientRect();
+            if (/^[A-Za-z]+ \d{4}$/.test(txt) && r.top > inputBottom - 60 && r.top < inputBottom + 200) {
+              let ancestor = el.parentElement;
+              for (let i = 0; i < 8 && ancestor; i++) {
+                const ar = ancestor.getBoundingClientRect();
+                if (ar.width > 100 && ar.height > 100) { pickerRoot = ancestor; break; }
+                ancestor = ancestor.parentElement;
+              }
+              if (!pickerRoot) pickerRoot = el.parentElement;
+              break;
+            }
+          }
+          const root = pickerRoot || document;
+          for (const el of [...root.querySelectorAll('*')]) {
+            if ((el.innerText || '').trim() !== String(day)) continue;
+            const r = el.getBoundingClientRect();
+            if (r.top > inputBottom - 10 && r.width >= 20 && r.width <= 70 && r.height >= 18 && r.height <= 70) {
+              el.click();
+              return { x: Math.round(r.left), y: Math.round(r.top) };
+            }
+          }
+          return null;
+        }, { day: targetDay, inputBottom: dateInputPos.bottom });
+
+        if (dayClicked) {
+          console.log(`[Reschedule] Day ${targetDay} clicked at:`, JSON.stringify(dayClicked));
+          break;
+        }
+        // Navigate to next month
+        const nextClicked = await page.evaluate(({ inputBottom }) => {
+          for (const el of document.querySelectorAll('*')) {
+            const txt = (el.innerText || '').trim();
+            const r   = el.getBoundingClientRect();
+            if ((txt === '›' || txt === '>') && r.top > inputBottom - 30) { el.click(); return true; }
+          }
+          return false;
+        }, { inputBottom: dateInputPos.bottom });
+        if (!nextClicked) break;
+        await page.waitForTimeout(500);
+      }
+      await page.waitForTimeout(1000);
+      // Close picker cleanly
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(400);
+    }
+
+    await screenshot(page, 'debug-reschedule-step2-date.png');
+    console.log('[Reschedule] Date updated');
+
+    // ── Step 5: Change the time ─────────────────────────────────────────────
     console.log(`[Reschedule] Setting new time: ${newTime}`);
-    await page.fill(
-      'input[type="time"], input[name*="time"], input[placeholder*="time"], input[id*="time"]',
-      newTime
-    ).catch(async () => {
-      // Try selecting from a dropdown
-      await page.selectOption(
-        'select[name*="time"], select[id*="time"]',
-        { label: newTime }
-      ).catch(() => {
-        console.log('[Reschedule] Could not set time — manual review may be needed.');
+    const timeMatch = newTime.match(/(\d{1,2}):(\d{2})\s?(AM|PM)/i);
+    if (timeMatch) {
+      const tHour = String(parseInt(timeMatch[1], 10));
+      const tAmpm = timeMatch[3].toUpperCase();
+      const rawMin = parseInt(timeMatch[2], 10);
+      const minOpts = [0, 15, 30, 45];
+      const rounded = minOpts.reduce((a, b) => Math.abs(b - rawMin) < Math.abs(a - rawMin) ? b : a);
+      const tMin = String(rounded).padStart(2, '0');
+      console.log(`[Reschedule] Parsed time → hour=${tHour}, min=${tMin}, ampm=${tAmpm}`);
+
+      const spinnerCoords = await page.evaluate(() => {
+        const container = document.querySelector('[data-cs_field_name="start_time"]');
+        if (!container) return [];
+        const cr = container.getBoundingClientRect();
+        const candidates = [...container.querySelectorAll('.BOX-flex-manager')].filter(el => {
+          const r = el.getBoundingClientRect();
+          return r.width >= 60 && r.width <= 90 && r.height >= 25 && r.height <= 55 && r.top > cr.top + 5;
+        });
+        const xVals = candidates.map(el => Math.round(el.getBoundingClientRect().left)).sort((a, b) => a - b);
+        const clusters = [];
+        for (const x of xVals) {
+          if (clusters.length === 0 || x - clusters[clusters.length - 1] > 50) clusters.push(x);
+          if (clusters.length === 3) break;
+        }
+        return clusters.map(x => {
+          const el = candidates.find(e => Math.abs(Math.round(e.getBoundingClientRect().left) - x) <= 5);
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        }).filter(Boolean);
       });
-    });
+      console.log('[Reschedule] Spinner coords:', JSON.stringify(spinnerCoords));
+
+      if (spinnerCoords.length >= 3) {
+        const [hourSpinner, minSpinner, ampmSpinner] = spinnerCoords;
+
+        await page.mouse.click(hourSpinner.x, hourSpinner.y);
+        await page.waitForTimeout(800);
+        const hourOk = await selectDropdownValue(page, tHour, hourSpinner.y + 20, hourSpinner.x);
+        console.log(`[Reschedule] Hour ${tHour}:`, hourOk);
+        await page.waitForTimeout(500);
+
+        await page.mouse.click(minSpinner.x, minSpinner.y);
+        await page.waitForTimeout(800);
+        const minOk = await selectDropdownValue(page, tMin, minSpinner.y + 20, minSpinner.x);
+        console.log(`[Reschedule] Minute ${tMin}:`, minOk);
+        await page.waitForTimeout(500);
+
+        await page.mouse.click(ampmSpinner.x, ampmSpinner.y);
+        await page.waitForTimeout(800);
+        const ampmOk = await selectDropdownValue(page, tAmpm, ampmSpinner.y + 20, ampmSpinner.x);
+        console.log(`[Reschedule] AM/PM ${tAmpm}:`, ampmOk);
+        await page.waitForTimeout(500);
+      } else {
+        console.log('[Reschedule] WARNING: could not find all 3 spinners');
+      }
+    }
 
     await page.waitForTimeout(1000);
+    await screenshot(page, 'debug-reschedule-step3-time.png');
 
-    // Save changes
-    console.log('[Reschedule] Saving rescheduled appointment...');
-    await page.click(
-      'button[type="submit"], button:has-text("Save"), button:has-text("Update"), button:has-text("Confirm")',
-      { timeout: TIMEOUT }
-    );
+    // ── Step 6: Save & Close ────────────────────────────────────────────────
+    console.log('[Reschedule] Clicking SAVE & CLOSE...');
+    const saveCoord = await page.evaluate(() => {
+      for (const el of document.querySelectorAll('*')) {
+        if ((el.innerText || '').trim() === 'SAVE & CLOSE') {
+          const r = el.getBoundingClientRect();
+          if (r.bottom > 800 && r.width > 50)
+            return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        }
+      }
+      return null;
+    });
 
-    await page.waitForTimeout(3000);
+    if (saveCoord) {
+      await page.mouse.click(saveCoord.x, saveCoord.y);
+    } else {
+      await page.locator('text=SAVE & CLOSE').last().click({ timeout: TIMEOUT });
+    }
 
-    // Take screenshot
+    await page.waitForTimeout(4000);
     await screenshot(page, 'debug-reschedule.png');
 
-    console.log('[Reschedule] Rescheduling complete!');
+    // Verify: form should be gone and no validation error
+    const errorText = await page.evaluate(() => {
+      for (const el of document.querySelectorAll('*')) {
+        const txt = (el.innerText || '').trim();
+        if (txt.toLowerCase().includes('please correct') || txt.toLowerCase().includes('server error')) return txt;
+      }
+      return null;
+    });
+    if (errorText) throw new Error(`Form validation error: ${errorText}`);
 
-    res.json({ success: true, message: 'Appointment rescheduled' });
+    console.log('[Reschedule] Rescheduled successfully!');
+    res.json({
+      success: true,
+      message: 'Appointment rescheduled',
+      details: { from: `${oldDate} ${oldTime}`, to: `${newDate} ${newTime}`, client: clientName },
+    });
   } catch (err) {
     console.error('[Reschedule] ERROR:', err.message);
     if (page) await screenshot(page, 'debug-reschedule.png').catch(() => {});
