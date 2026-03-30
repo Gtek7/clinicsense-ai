@@ -5,8 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js",
-    "postinstall": "npx playwright install chromium --with-deps"
+    "dev": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
