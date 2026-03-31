@@ -153,35 +153,50 @@ app.post('/check-availability', async (req, res) => {
     });
     console.log(`[Availability] DOM schedule parsed: ${domSchedule.length} practitioners`);
 
-    // Step 10: Fetch calendar API using page.goto() — avoids fetch() CORS/session issues
-    const calApiUrl = `https://clinicsense.com/api/2/calendar/?mode=day&exact_date=${date}&format=json`;
-    console.log(`[Availability] Fetching calendar API via page.goto(): ${calApiUrl}`);
+    // Step 10: Fetch calendar API using fetch() inside page.evaluate() while STAYING on the
+    // calendar page. Using relative URLs ensures session cookies are included automatically.
+    // page.goto() was tried but caused a redirect to the login page (session lost).
+    const calRelUrl = `/api/2/calendar/?mode=day&exact_date=${date}&format=json`;
+    console.log(`[Availability] Fetching calendar API (relative URL): ${calRelUrl}`);
     await screenshot(page, 'debug-pre-api.png');
 
-    const fetchViaGoto = async (apiUrl, label) => {
-      const resp = await page.goto(apiUrl, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
-      const status = resp ? resp.status() : 0;
-      // page.goto() renders JSON as <html><body><pre>...</pre></body></html> in Chromium
-      const bodyText = await page.evaluate(() => document.body.innerText);
-      console.log(`[Availability] ${label} → status=${status}, body preview: ${bodyText.substring(0, 500)}`);
-      return { status, bodyText };
+    const fetchViaEvaluate = async (relUrl, label) => {
+      return page.evaluate(async ({ url, lbl }) => {
+        console.log(`[browser] ${lbl} → fetching: ${url}`);
+        try {
+          const resp = await fetch(url, {
+            credentials: 'include',
+            headers: { 'Accept': 'application/json' },
+          });
+          const text = await resp.text();
+          console.log(`[browser] ${lbl} → status=${resp.status}, preview=${text.substring(0, 300)}`);
+          if (text.trim().startsWith('<')) {
+            return { __error: true, status: resp.status, preview: text.substring(0, 300) };
+          }
+          return { __error: false, status: resp.status, bodyText: text };
+        } catch (e) {
+          return { __error: true, message: e.message };
+        }
+      }, { url: relUrl, lbl: label });
     };
 
-    let calResult = await fetchViaGoto(calApiUrl, 'calendar API (attempt 1)');
+    let calResult = await fetchViaEvaluate(calRelUrl, 'calendar API (attempt 1)');
+    console.log(`[Availability] calendar API attempt 1 → status=${calResult.status}, error=${calResult.__error}, preview=${(calResult.preview || calResult.bodyText || '').substring(0, 300)}`);
 
-    // Retry once on 500
-    if (calResult.status === 500 || calResult.bodyText.trim().startsWith('<')) {
-      console.log('[Availability] Calendar API returned 500 or HTML, waiting 5s then retrying...');
+    // Retry once on 500 or HTML response
+    if (calResult.__error) {
+      console.log('[Availability] Attempt 1 failed, waiting 5s then retrying...');
       await page.waitForTimeout(5000);
       await screenshot(page, 'debug-pre-api-retry.png');
-      calResult = await fetchViaGoto(calApiUrl, 'calendar API (attempt 2)');
+      calResult = await fetchViaEvaluate(calRelUrl, 'calendar API (attempt 2)');
+      console.log(`[Availability] calendar API attempt 2 → status=${calResult.status}, error=${calResult.__error}, preview=${(calResult.preview || calResult.bodyText || '').substring(0, 300)}`);
     }
 
-    if (calResult.status !== 200 || calResult.bodyText.trim().startsWith('<')) {
+    if (calResult.__error) {
       await screenshot(page, 'debug-availability-api-error.png');
       throw new Error(
-        `ClinicSense calendar API returned non-JSON (status ${calResult.status}). ` +
-        `Preview: ${calResult.bodyText.substring(0, 300)}`
+        `ClinicSense calendar API failed (status ${calResult.status}). ` +
+        `Preview: ${(calResult.preview || calResult.message || '').substring(0, 300)}`
       );
     }
 
@@ -193,15 +208,13 @@ app.post('/check-availability', async (req, res) => {
       throw new Error(`Failed to parse calendar API JSON: ${e.message}. Preview: ${calResult.bodyText.substring(0, 300)}`);
     }
 
-    // Fetch staff list
-    const staffApiUrl = 'https://clinicsense.com/api/2/staff/?format=json';
-    console.log(`[Availability] Fetching staff API via page.goto(): ${staffApiUrl}`);
+    // Fetch staff list (relative URL, same page context)
+    console.log('[Availability] Fetching staff API...');
     let staffList = [];
     try {
-      const staffResult = await fetchViaGoto(staffApiUrl, 'staff API');
-      if (staffResult.status === 200 && !staffResult.bodyText.trim().startsWith('<')) {
-        staffList = JSON.parse(staffResult.bodyText);
-      }
+      const staffResult = await fetchViaEvaluate('/api/2/staff/?format=json', 'staff API');
+      console.log(`[Availability] staff API → status=${staffResult.status}, error=${staffResult.__error}`);
+      if (!staffResult.__error) staffList = JSON.parse(staffResult.bodyText);
     } catch (_) {
       console.log('[Availability] Staff API fetch failed, continuing without staff list');
     }
