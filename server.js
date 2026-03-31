@@ -50,6 +50,8 @@ async function newPage() {
 async function login(page) {
   console.log('[Login] Navigating to login page...');
   await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
+  await page.waitForTimeout(2000);
+  await screenshot(page, 'debug-login-page.png');
 
   console.log('[Login] Waiting for email field...');
   await page.waitForSelector('input[type="email"], input[name="email"], input[placeholder*="Email"], input[id*="email"]', { timeout: TIMEOUT });
@@ -68,12 +70,16 @@ async function login(page) {
     console.log('[Login] Navigation event not fired, continuing...');
   });
 
+  // Extra wait to let the SPA fully initialise after redirect
+  await page.waitForTimeout(3000);
+  await screenshot(page, 'debug-login-result.png');
+
   // Confirm we are no longer on the login page
   const currentUrl = page.url();
   console.log(`[Login] Current URL after login: ${currentUrl}`);
 
   if (currentUrl.includes('/login')) {
-    throw new Error('Login failed — still on login page. Check credentials.');
+    throw new Error('Login failed — still on login page. Check credentials or network.');
   }
 
   console.log('[Login] Login successful!');
@@ -128,19 +134,37 @@ app.post('/check-availability', async (req, res) => {
     // Step 9 & 10: Call ClinicSense API directly using the authenticated session.
     // The UI ignores ?date= URL params — the real data comes from this internal API.
     console.log(`[Availability] Calling ClinicSense API for date: ${date}`);
+    await screenshot(page, 'debug-availability-before-api.png');
+
     const rawData = await page.evaluate(async (targetDate) => {
       // ── A. Fetch date-specific calendar data ─────────────────────────────────
-      const calResp = await fetch(
-        `/api/2/calendar/?mode=day&exact_date=${targetDate}&format=json`,
-        { credentials: 'include' }
-      );
-      const calData = await calResp.json();
+      const calUrl = `/api/2/calendar/?mode=day&exact_date=${targetDate}&format=json`;
+      const calResp = await fetch(calUrl, { credentials: 'include' });
+      const calText = await calResp.text();
+
+      // Guard: if we got HTML back (session expired / login redirect), bail early
+      if (!calResp.ok || calText.trim().startsWith('<')) {
+        return {
+          __error: true,
+          status: calResp.status,
+          url: calResp.url,
+          preview: calText.substring(0, 300),
+        };
+      }
+
+      let calData;
+      try {
+        calData = JSON.parse(calText);
+      } catch (e) {
+        return { __error: true, parseError: e.message, preview: calText.substring(0, 300) };
+      }
 
       // ── B. Fetch full staff list for id → name mapping ───────────────────────
       let staffList = [];
       try {
         const staffResp = await fetch('/api/2/staff/?format=json', { credentials: 'include' });
-        staffList = await staffResp.json();
+        const staffText = await staffResp.text();
+        if (!staffText.trim().startsWith('<')) staffList = JSON.parse(staffText);
       } catch (_) {}
 
       // ── C. Parse DOM header for working hours per practitioner ────────────────
@@ -170,6 +194,16 @@ app.post('/check-availability', async (req, res) => {
 
       return { calData, staffList, domSchedule };
     }, date);
+
+    // ── Detect API error (HTML response / session expired) ────────────────────
+    if (rawData.__error) {
+      await screenshot(page, 'debug-availability-api-error.png');
+      console.error('[Availability] API returned non-JSON:', JSON.stringify(rawData));
+      throw new Error(
+        `ClinicSense API returned HTML instead of JSON (status ${rawData.status}). ` +
+        `This usually means the session expired or login failed. Preview: ${rawData.preview?.substring(0, 150)}`
+      );
+    }
 
     // ── Inspect raw API staff data to determine format ────────────────────────
     const rawStaff     = rawData.calData?.staff || {};
