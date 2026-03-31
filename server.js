@@ -119,97 +119,94 @@ app.post('/check-availability', async (req, res) => {
     await login(page);
 
     // Step 8: Navigate directly to the calendar page and wait for it to fully load.
-    // This ensures the session cookie is active in the correct page context before
-    // making any API calls from within page.evaluate().
     console.log('[Availability] Navigating to calendar page...');
     await page.goto(CALENDAR_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(8000); // 8s to ensure full SPA initialisation
     await screenshot(page, 'debug-availability-calendar.png');
+    console.log(`[Availability] Calendar page loaded. Current URL: ${page.url()}`);
 
-    // Step 9 & 10: Call ClinicSense API directly using the authenticated session.
-    // The UI ignores ?date= URL params — the real data comes from this internal API.
-    console.log(`[Availability] Calling ClinicSense API for date: ${date}`);
-
-    // Helper: perform the fetch inside page context and return structured result
-    const fetchCalendarData = async (targetDate) => page.evaluate(async (targetDate) => {
-      const calUrl = `/api/2/calendar/?mode=day&exact_date=${targetDate}&format=json`;
-      const calResp = await fetch(calUrl, { credentials: 'include' });
-      const calText = await calResp.text();
-
-      // Guard: if we got HTML back (session expired / 500 error page), bail early
-      if (!calResp.ok || calText.trim().startsWith('<')) {
-        return {
-          __error: true,
-          status: calResp.status,
-          url: calResp.url,
-          preview: calText.substring(0, 300),
-        };
-      }
-
-      let calData;
-      try {
-        calData = JSON.parse(calText);
-      } catch (e) {
-        return { __error: true, parseError: e.message, preview: calText.substring(0, 300) };
-      }
-
-      // ── B. Fetch full staff list for id → name mapping ───────────────────────
-      let staffList = [];
-      try {
-        const staffResp = await fetch('/api/2/staff/?format=json', { credentials: 'include' });
-        const staffText = await staffResp.text();
-        if (!staffText.trim().startsWith('<')) staffList = JSON.parse(staffText);
-      } catch (_) {}
-
-      // ── C. Parse DOM header for working hours per practitioner ────────────────
-      // ClinicSense shows "NAME\nHH:MM AM\n-\nHH:MM PM" or "NAME\nOff" in the top bar
+    // Step 9: Parse DOM schedule while still on the calendar page (before navigating to API URLs)
+    console.log('[Availability] Parsing DOM schedule from calendar page...');
+    const domSchedule = await page.evaluate(() => {
+      const UI_SKIP = /^(CALENDAR|CLIENTS|SELL|COMMUNICATION|REPORTS|SETUP|WAIT LIST|Location|Practitioners|Office staff|Services|Treatment|Form|Scheduling|Payment|Reminders|Notification|Auto|Change|Perks|Logout|TODAY|Switch|Print|Hide|ZOOM|LINK|Schedule|VIP|★)/i;
       const bodyText = document.body.innerText;
       const headerSection = bodyText.split(/12AM\n12:15AM/)[0];
       const lines = headerSection.split('\n').map(l => l.trim()).filter(Boolean);
-      const UI_SKIP = /^(CALENDAR|CLIENTS|SELL|COMMUNICATION|REPORTS|SETUP|WAIT LIST|Location|Practitioners|Office staff|Services|Treatment|Form|Scheduling|Payment|Reminders|Notification|Auto|Change|Perks|Logout|TODAY|Switch|Print|Hide|ZOOM|LINK|Schedule|VIP|★)/i;
-
-      const domSchedule = [];
+      const result = [];
       let i = 0;
       while (i < lines.length) {
         const line = lines[i];
         if (line.length < 2 || line.length > 90 || UI_SKIP.test(line) || /^\d/.test(line)) { i++; continue; }
         if (lines[i + 1] === 'Off') {
-          domSchedule.push({ name: line, working: false, start: null, end: null });
+          result.push({ name: line, working: false, start: null, end: null });
           i += 2;
         } else if (
           lines[i + 1]?.match(/^\d{1,2}:\d{2}\s?(AM|PM)/i) &&
           lines[i + 2] === '-' &&
           lines[i + 3]?.match(/^\d{1,2}:\d{2}\s?(AM|PM)/i)
         ) {
-          domSchedule.push({ name: line, working: true, start: lines[i + 1], end: lines[i + 3] });
+          result.push({ name: line, working: true, start: lines[i + 1], end: lines[i + 3] });
           i += 4;
         } else { i++; }
       }
+      return result;
+    });
+    console.log(`[Availability] DOM schedule parsed: ${domSchedule.length} practitioners`);
 
-      return { calData, staffList, domSchedule };
-    }, targetDate);
-
+    // Step 10: Fetch calendar API using page.goto() — avoids fetch() CORS/session issues
+    const calApiUrl = `https://clinicsense.com/api/2/calendar/?mode=day&exact_date=${date}&format=json`;
+    console.log(`[Availability] Fetching calendar API via page.goto(): ${calApiUrl}`);
     await screenshot(page, 'debug-pre-api.png');
-    console.log('[Availability] Making API call (attempt 1)...');
-    let rawData = await fetchCalendarData(date);
 
-    // ── Retry once on 500 ────────────────────────────────────────────────────
-    if (rawData.__error && rawData.status === 500) {
-      console.log(`[Availability] API returned 500, waiting 3s then retrying...`);
-      await page.waitForTimeout(3000);
+    const fetchViaGoto = async (apiUrl, label) => {
+      const resp = await page.goto(apiUrl, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
+      const status = resp ? resp.status() : 0;
+      // page.goto() renders JSON as <html><body><pre>...</pre></body></html> in Chromium
+      const bodyText = await page.evaluate(() => document.body.innerText);
+      console.log(`[Availability] ${label} → status=${status}, body preview: ${bodyText.substring(0, 500)}`);
+      return { status, bodyText };
+    };
+
+    let calResult = await fetchViaGoto(calApiUrl, 'calendar API (attempt 1)');
+
+    // Retry once on 500
+    if (calResult.status === 500 || calResult.bodyText.trim().startsWith('<')) {
+      console.log('[Availability] Calendar API returned 500 or HTML, waiting 5s then retrying...');
+      await page.waitForTimeout(5000);
       await screenshot(page, 'debug-pre-api-retry.png');
-      rawData = await fetchCalendarData(date);
+      calResult = await fetchViaGoto(calApiUrl, 'calendar API (attempt 2)');
     }
 
-    // ── Detect API error (HTML response / session expired) ────────────────────
-    if (rawData.__error) {
+    if (calResult.status !== 200 || calResult.bodyText.trim().startsWith('<')) {
       await screenshot(page, 'debug-availability-api-error.png');
-      console.error('[Availability] API returned non-JSON:', JSON.stringify(rawData));
       throw new Error(
-        `ClinicSense API returned non-JSON (status ${rawData.status}). ` +
-        `Preview: ${rawData.preview?.substring(0, 200)}`
+        `ClinicSense calendar API returned non-JSON (status ${calResult.status}). ` +
+        `Preview: ${calResult.bodyText.substring(0, 300)}`
       );
     }
+
+    let calData;
+    try {
+      calData = JSON.parse(calResult.bodyText);
+    } catch (e) {
+      await screenshot(page, 'debug-availability-api-error.png');
+      throw new Error(`Failed to parse calendar API JSON: ${e.message}. Preview: ${calResult.bodyText.substring(0, 300)}`);
+    }
+
+    // Fetch staff list
+    const staffApiUrl = 'https://clinicsense.com/api/2/staff/?format=json';
+    console.log(`[Availability] Fetching staff API via page.goto(): ${staffApiUrl}`);
+    let staffList = [];
+    try {
+      const staffResult = await fetchViaGoto(staffApiUrl, 'staff API');
+      if (staffResult.status === 200 && !staffResult.bodyText.trim().startsWith('<')) {
+        staffList = JSON.parse(staffResult.bodyText);
+      }
+    } catch (_) {
+      console.log('[Availability] Staff API fetch failed, continuing without staff list');
+    }
+
+    const rawData = { calData, staffList, domSchedule, __error: false };
 
     // ── Inspect raw API staff data to determine format ────────────────────────
     const rawStaff     = rawData.calData?.staff || {};
