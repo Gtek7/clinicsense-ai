@@ -118,181 +118,169 @@ app.post('/check-availability', async (req, res) => {
     // Step 1-7: Login
     await login(page);
 
-    // Step 8: Navigate directly to the calendar page and wait for it to fully load.
+    // Step 8: Navigate to calendar page and wait for full SPA load
     console.log('[Availability] Navigating to calendar page...');
     await page.goto(CALENDAR_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
-    await page.waitForTimeout(8000); // 8s to ensure full SPA initialisation
+    await page.waitForTimeout(8000);
     await screenshot(page, 'debug-availability-calendar.png');
-    console.log(`[Availability] Calendar page loaded. Current URL: ${page.url()}`);
+    console.log(`[Availability] Calendar loaded. URL: ${page.url()}`);
 
-    // Step 9: Parse DOM schedule while still on the calendar page (before navigating to API URLs)
-    console.log('[Availability] Parsing DOM schedule from calendar page...');
-    const domSchedule = await page.evaluate(() => {
+    // Step 9: Navigate to the requested date using calendar chevrons
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const target = new Date(date + 'T00:00:00');
+    const daysDiff = Math.round((target - today) / 86400000);
+    console.log(`[Availability] Days from today to ${date}: ${daysDiff}`);
+
+    if (daysDiff !== 0) {
+      const arrowCls = daysDiff > 0
+        ? '.linearicon-chevron-right-circle'
+        : '.linearicon-chevron-left-circle';
+      for (let i = 0; i < Math.abs(daysDiff); i++) {
+        await page.evaluate((cls) => { document.querySelector(cls)?.click(); }, arrowCls);
+        await page.waitForTimeout(800);
+      }
+      await page.waitForTimeout(2000);
+      await screenshot(page, 'debug-availability-target-date.png');
+      console.log('[Availability] Navigated to target date.');
+    }
+
+    // Step 10: Parse all data from DOM — no API calls needed
+    console.log('[Availability] Parsing calendar DOM...');
+    const calendarData = await page.evaluate(() => {
+      // ── A. Parse practitioner schedule from text header ──────────────────────
       const UI_SKIP = /^(CALENDAR|CLIENTS|SELL|COMMUNICATION|REPORTS|SETUP|WAIT LIST|Location|Practitioners|Office staff|Services|Treatment|Form|Scheduling|Payment|Reminders|Notification|Auto|Change|Perks|Logout|TODAY|Switch|Print|Hide|ZOOM|LINK|Schedule|VIP|★)/i;
       const bodyText = document.body.innerText;
       const headerSection = bodyText.split(/12AM\n12:15AM/)[0];
       const lines = headerSection.split('\n').map(l => l.trim()).filter(Boolean);
-      const result = [];
-      let i = 0;
-      while (i < lines.length) {
-        const line = lines[i];
-        if (line.length < 2 || line.length > 90 || UI_SKIP.test(line) || /^\d/.test(line)) { i++; continue; }
-        if (lines[i + 1] === 'Off') {
-          result.push({ name: line, working: false, start: null, end: null });
-          i += 2;
+      const practitioners = [];
+      let idx = 0;
+      while (idx < lines.length) {
+        const line = lines[idx];
+        if (line.length < 2 || line.length > 90 || UI_SKIP.test(line) || /^\d/.test(line)) { idx++; continue; }
+        if (lines[idx + 1] === 'Off') {
+          practitioners.push({ name: line, working: false, start: null, end: null, colX: null });
+          idx += 2;
         } else if (
-          lines[i + 1]?.match(/^\d{1,2}:\d{2}\s?(AM|PM)/i) &&
-          lines[i + 2] === '-' &&
-          lines[i + 3]?.match(/^\d{1,2}:\d{2}\s?(AM|PM)/i)
+          lines[idx + 1]?.match(/^\d{1,2}:\d{2}\s?(AM|PM)/i) &&
+          lines[idx + 2] === '-' &&
+          lines[idx + 3]?.match(/^\d{1,2}:\d{2}\s?(AM|PM)/i)
         ) {
-          result.push({ name: line, working: true, start: lines[i + 1], end: lines[i + 3] });
-          i += 4;
-        } else { i++; }
+          practitioners.push({ name: line, working: true, start: lines[idx + 1], end: lines[idx + 3], colX: null });
+          idx += 4;
+        } else { idx++; }
       }
-      return result;
-    });
-    console.log(`[Availability] DOM schedule parsed: ${domSchedule.length} practitioners`);
 
-    // Step 10: Fetch calendar API using fetch() inside page.evaluate() while STAYING on the
-    // calendar page. Using relative URLs ensures session cookies are included automatically.
-    // page.goto() was tried but caused a redirect to the login page (session lost).
-    const calRelUrl = `/api/2/calendar/?mode=day&exact_date=${date}&format=json`;
-    console.log(`[Availability] Fetching calendar API (relative URL): ${calRelUrl}`);
-    await screenshot(page, 'debug-pre-api.png');
-
-    const fetchViaEvaluate = async (relUrl, label) => {
-      return page.evaluate(async ({ url, lbl }) => {
-        console.log(`[browser] ${lbl} → fetching: ${url}`);
-        try {
-          const resp = await fetch(url, {
-            credentials: 'include',
-            headers: { 'Accept': 'application/json' },
-          });
-          const text = await resp.text();
-          console.log(`[browser] ${lbl} → status=${resp.status}, preview=${text.substring(0, 300)}`);
-          if (text.trim().startsWith('<')) {
-            return { __error: true, status: resp.status, preview: text.substring(0, 300) };
+      // ── B. Find each working practitioner's column x-position from the DOM ──
+      for (const prac of practitioners.filter(p => p.working)) {
+        const nameNorm = prac.name.toUpperCase().replace(/\s+/g, ' ').trim();
+        for (const el of document.querySelectorAll('*')) {
+          const txt = (el.innerText || '').trim().toUpperCase().replace(/\s+/g, ' ');
+          if ((txt === nameNorm || txt.startsWith(nameNorm + '\n') || txt.startsWith(nameNorm + ' ')) &&
+              el.children.length < 5) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 20 && r.height > 0 && r.top < 350) {
+              prac.colX = Math.round(r.left + r.width / 2);
+              break;
+            }
           }
-          return { __error: false, status: resp.status, bodyText: text };
-        } catch (e) {
-          return { __error: true, message: e.message };
-        }
-      }, { url: relUrl, lbl: label });
-    };
-
-    let calResult = await fetchViaEvaluate(calRelUrl, 'calendar API (attempt 1)');
-    console.log(`[Availability] calendar API attempt 1 → status=${calResult.status}, error=${calResult.__error}, preview=${(calResult.preview || calResult.bodyText || '').substring(0, 300)}`);
-
-    // Retry once on 500 or HTML response
-    if (calResult.__error) {
-      console.log('[Availability] Attempt 1 failed, waiting 5s then retrying...');
-      await page.waitForTimeout(5000);
-      await screenshot(page, 'debug-pre-api-retry.png');
-      calResult = await fetchViaEvaluate(calRelUrl, 'calendar API (attempt 2)');
-      console.log(`[Availability] calendar API attempt 2 → status=${calResult.status}, error=${calResult.__error}, preview=${(calResult.preview || calResult.bodyText || '').substring(0, 300)}`);
-    }
-
-    if (calResult.__error) {
-      await screenshot(page, 'debug-availability-api-error.png');
-      throw new Error(
-        `ClinicSense calendar API failed (status ${calResult.status}). ` +
-        `Preview: ${(calResult.preview || calResult.message || '').substring(0, 300)}`
-      );
-    }
-
-    let calData;
-    try {
-      calData = JSON.parse(calResult.bodyText);
-    } catch (e) {
-      await screenshot(page, 'debug-availability-api-error.png');
-      throw new Error(`Failed to parse calendar API JSON: ${e.message}. Preview: ${calResult.bodyText.substring(0, 300)}`);
-    }
-
-    // Fetch staff list (relative URL, same page context)
-    console.log('[Availability] Fetching staff API...');
-    let staffList = [];
-    try {
-      const staffResult = await fetchViaEvaluate('/api/2/staff/?format=json', 'staff API');
-      console.log(`[Availability] staff API → status=${staffResult.status}, error=${staffResult.__error}`);
-      if (!staffResult.__error) staffList = JSON.parse(staffResult.bodyText);
-    } catch (_) {
-      console.log('[Availability] Staff API fetch failed, continuing without staff list');
-    }
-
-    const rawData = { calData, staffList, domSchedule, __error: false };
-
-    // ── Inspect raw API staff data to determine format ────────────────────────
-    const rawStaff     = rawData.calData?.staff || {};
-    const rawStaffList = rawData.staffList       || [];
-    const isStaffArray = Array.isArray(rawStaff);
-    const isStaffObj   = !isStaffArray && rawStaff && typeof rawStaff === 'object';
-    console.log(`[Availability] calData.staff format: ${isStaffArray ? 'array' : isStaffObj ? 'object/dict' : typeof rawStaff}`);
-    if (isStaffObj) {
-      const firstKey   = Object.keys(rawStaff)[0];
-      const firstEntry = rawStaff[firstKey];
-      console.log(`[Availability] Sample staff entry [${firstKey}]:`, JSON.stringify(firstEntry)?.substring(0, 200));
-    }
-
-    // ── Build staff id → name map (handles all formats) ───────────────────────
-    const staffIdToName = {};
-
-    // Format A: calData.staff is a dict: { "64383": { id, name, ... } }
-    if (isStaffObj) {
-      for (const [sid, entry] of Object.entries(rawStaff)) {
-        if (entry && typeof entry === 'object') {
-          staffIdToName[sid] = entry.name || entry.full_name ||
-            `${entry.first_name || ''} ${entry.last_name || ''}`.trim() || `Staff #${sid}`;
-        } else if (typeof entry === 'string') {
-          staffIdToName[sid] = entry;
         }
       }
-    }
-    // Format B: calData.staff is array of objects: [{ id, name }, ...]
-    if (isStaffArray && rawStaff.length && typeof rawStaff[0] === 'object' && rawStaff[0]?.id) {
-      rawStaff.forEach(s => {
-        const id = s.id || s.staff_id;
-        if (id) staffIdToName[id] = s.name || s.full_name ||
-          `${s.first_name || ''} ${s.last_name || ''}`.trim() || `Staff #${id}`;
-      });
-    }
-    // Format C: calData.staff is array of IDs → positional match to DOM columns
-    const workingDomStaff = rawData.domSchedule.filter(s => s.working && s.start && s.end);
-    if (Object.keys(staffIdToName).length === 0 &&
-        isStaffArray && rawStaff.length && typeof rawStaff[0] === 'number') {
-      console.log('[Availability] staff is ID array — using positional matching to DOM columns');
-      rawStaff.forEach((sid, idx) => {
-        const dom = workingDomStaff[idx];
-        if (dom) staffIdToName[sid] = dom.name;
-      });
-    }
 
-    console.log(`[Availability] Mapped ${Object.keys(staffIdToName).length} staff IDs → names:`, staffIdToName);
+      // ── C. Calibrate time grid: map pixel y-positions to clock times ─────────
+      const timeLabels = [];
+      for (const el of document.querySelectorAll('*')) {
+        const txt = (el.innerText || '').trim();
+        // Match labels like "7AM", "8AM", "1PM" etc.
+        const m = txt.match(/^(\d{1,2})(AM|PM)$/i);
+        if (!m) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0 || r.top < 100) continue;
+        let h = parseInt(m[1]);
+        if (m[2].toUpperCase() === 'PM' && h !== 12) h += 12;
+        if (m[2].toUpperCase() === 'AM' && h === 12) h = 0;
+        // Deduplicate (same hour may appear multiple times)
+        if (!timeLabels.some(t => Math.abs(t.mins - h * 60) < 30 && Math.abs(t.y - r.top) < 5)) {
+          timeLabels.push({ mins: h * 60, y: r.top });
+        }
+      }
+      timeLabels.sort((a, b) => a.y - b.y);
 
-    // ── Group API appointments by staff_id ─────────────────────────────────────
-    const apptsByStaffId = {};
-    for (const appt of (rawData.calData?.appointments || [])) {
-      const sid = appt.staff_id || appt.practitioner_id;
-      if (!sid) continue;
-      if (!apptsByStaffId[sid]) apptsByStaffId[sid] = [];
-      const times = Object.values(appt.times || {})[0]?.[0];
-      apptsByStaffId[sid].push({
-        client:  appt.client_name || 'Unknown',
-        service: appt.service_name || 'Unknown',
-        start:   times?.start_time || appt.start_time,
-        end:     times?.end_time   || appt.end_time,
-      });
-    }
-    console.log(`[Availability] API returned ${rawData.calData?.appointments?.length || 0} appointments across ${Object.keys(apptsByStaffId).length} staff members`);
+      let pxPerMin = null, refLabel = null;
+      if (timeLabels.length >= 2) {
+        const first = timeLabels[0];
+        const last  = timeLabels[timeLabels.length - 1];
+        if (last.mins !== first.mins) {
+          pxPerMin = (last.y - first.y) / (last.mins - first.mins);
+          refLabel = first;
+        }
+      }
+
+      // ── D. Parse booked appointment blocks from the calendar grid ────────────
+      const appointments = [];
+      const eventEls = document.querySelectorAll(
+        '.calendar-event, .calendar-appointment, [class*="calendar-event"], [class*="appt"], [class*="appointment"]'
+      );
+
+      const parseTime12 = (str) => {
+        const m = str.trim().match(/(\d{1,2}):(\d{2})\s?(AM|PM)/i);
+        if (!m) return null;
+        let h = parseInt(m[1]);
+        const min = parseInt(m[2]);
+        if (m[3].toUpperCase() === 'PM' && h !== 12) h += 12;
+        if (m[3].toUpperCase() === 'AM' && h === 12) h = 0;
+        return h * 60 + min;
+      };
+
+      for (const el of eventEls) {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0 || r.top < 100) continue;
+        const text = (el.innerText || '').trim();
+        const elX  = Math.round(r.left + r.width / 2);
+
+        let startMins = null, endMins = null;
+
+        // Strategy 1: extract HH:MM AM/PM times from visible text
+        const timeMatches = [...text.matchAll(/(\d{1,2}:\d{2}\s?(?:AM|PM))/gi)].map(x => x[1]);
+        if (timeMatches.length >= 2) {
+          startMins = parseTime12(timeMatches[0]);
+          endMins   = parseTime12(timeMatches[1]);
+        } else if (timeMatches.length === 1) {
+          startMins = parseTime12(timeMatches[0]);
+          if (startMins !== null && pxPerMin) endMins = startMins + Math.round(r.height / pxPerMin);
+        }
+
+        // Strategy 2: use CSS y-position relative to calibrated time grid
+        if (startMins === null && pxPerMin && refLabel) {
+          startMins = Math.round(refLabel.mins + (r.top  - refLabel.y) / pxPerMin);
+          endMins   = Math.round(refLabel.mins + (r.bottom - refLabel.y) / pxPerMin);
+          // Round to nearest 15 min
+          startMins = Math.round(startMins / 15) * 15;
+          endMins   = Math.round(endMins   / 15) * 15;
+        }
+
+        if (startMins !== null && endMins !== null && endMins > startMins) {
+          appointments.push({ text: text.substring(0, 120), x: elX, startMins, endMins });
+        }
+      }
+
+      return {
+        practitioners,
+        appointments,
+        debug: { pxPerMin, timeLabelsCount: timeLabels.length, eventsFound: eventEls.length },
+      };
+    });
+
+    console.log(`[Availability] DOM parse: ${calendarData.practitioners.length} practitioners, ` +
+      `${calendarData.appointments.length} appointments found. ` +
+      `pxPerMin=${calendarData.debug.pxPerMin?.toFixed(2)}, timeLabels=${calendarData.debug.timeLabelsCount}`);
 
     // ── Time helpers ───────────────────────────────────────────────────────────
-    // Convert "HH:MM:SS" or "H:MM AM/PM" → minutes since midnight
     const toMinutes = (timeStr) => {
       if (!timeStr) return null;
       timeStr = String(timeStr).trim();
-      // 24-hour format: "14:30:00" or "14:30"
       const m24 = timeStr.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
       if (m24) return parseInt(m24[1]) * 60 + parseInt(m24[2]);
-      // 12-hour format: "2:30 PM"
       const m12 = timeStr.match(/(\d{1,2}):(\d{2})\s?(AM|PM)/i);
       if (!m12) return null;
       let h = parseInt(m12[1]);
@@ -311,45 +299,38 @@ app.post('/check-availability', async (req, res) => {
       return `${h12}:${String(m).padStart(2, '0')} ${ampm}`;
     };
 
-    // ── Build per-practitioner output ─────────────────────────────────────────
-    console.log('[Availability] Computing per-practitioner available slots...');
+    // ── Step 11: Match appointments to practitioners by column x-position ──────
+    const workingPractitioners = calendarData.practitioners.filter(p => p.working && p.start && p.end);
+    console.log(`[Availability] Working practitioners: ${workingPractitioners.length}`);
+    workingPractitioners.forEach(p => console.log(`  ${p.name} | ${p.start} - ${p.end} | colX=${p.colX}`));
 
-    // Build practitioner list using working DOM staff (names + hours)
-    // Match to API staff_id using the staffIdToName map (populated above)
-    const seen = new Set();
+    // Build booked ranges per practitioner
+    const bookedByPrac = {};
+    for (const appt of calendarData.appointments) {
+      if (workingPractitioners.length === 0) break;
+      // Find the working practitioner whose column x is closest to this appointment's x
+      let bestPrac = null, bestDist = Infinity;
+      for (const prac of workingPractitioners) {
+        if (prac.colX === null) continue;
+        const dist = Math.abs(prac.colX - appt.x);
+        if (dist < bestDist) { bestDist = dist; bestPrac = prac; }
+      }
+      // Only assign if within 200px (avoids wild mismatches)
+      if (bestPrac && bestDist < 200) {
+        if (!bookedByPrac[bestPrac.name]) bookedByPrac[bestPrac.name] = [];
+        bookedByPrac[bestPrac.name].push(appt);
+      }
+    }
+
+    // ── Step 12: Build per-practitioner output ────────────────────────────────
     const practitionersOut = [];
-
-    for (const domStaff of workingDomStaff) {
-      // Find a matching staff_id: look for a staffIdToName entry whose value matches this DOM name
-      const domNameUpper = domStaff.name.toUpperCase().replace(/[-\s]+/g, ' ');
-      let matchedId = null;
-
-      for (const [sid, apiName] of Object.entries(staffIdToName)) {
-        const apiUpper = String(apiName).toUpperCase().replace(/[-\s]+/g, ' ');
-        // Match if names share at least one significant word (>2 chars)
-        const domWords = domNameUpper.split(' ').filter(w => w.length > 2);
-        if (domWords.some(w => apiUpper.includes(w))) {
-          matchedId = Number(sid);
-          break;
-        }
-      }
-
-      // Fallback: positional match using calData.staff index if name match fails
-      if (!matchedId && Array.isArray(rawStaff) && typeof rawStaff[0] === 'number') {
-        const idx = workingDomStaff.indexOf(domStaff);
-        if (rawStaff[idx] !== undefined) matchedId = rawStaff[idx];
-      }
-
-      const staffId = matchedId;
-      const name    = domStaff.name;
-      seen.add(staffId);
-
-      const bookings = staffId ? (apptsByStaffId[staffId] || []) : [];
-      const startMin = toMinutes(domStaff.start);
-      const endMin   = toMinutes(domStaff.end);
+    for (const prac of workingPractitioners) {
+      const startMin  = toMinutes(prac.start);
+      const endMin    = toMinutes(prac.end);
+      const bookings  = bookedByPrac[prac.name] || [];
 
       const bookedRanges = bookings
-        .map(b => ({ start: toMinutes(b.start), end: toMinutes(b.end) }))
+        .map(b => ({ start: b.startMins, end: b.endMins, text: b.text }))
         .filter(r => r.start !== null && r.end !== null);
 
       const freeSlots = [];
@@ -362,33 +343,26 @@ app.post('/check-availability', async (req, res) => {
       }
 
       practitionersOut.push({
-        name,
-        hours: `${domStaff.start} - ${domStaff.end}`,
+        name:            prac.name,
+        hours:           `${prac.start} - ${prac.end}`,
         available_slots: freeSlots,
-        booked_slots: bookings.map(b => ({
-          client:  b.client,
-          service: b.service,
-          time:    `${fromMinutes(toMinutes(b.start))} - ${fromMinutes(toMinutes(b.end))}`,
+        booked_slots:    bookedRanges.map(r => ({
+          time: `${fromMinutes(r.start)} - ${fromMinutes(r.end)}`,
+          info: r.text,
         })),
       });
+
+      console.log(`  ${prac.name}: ${freeSlots.length} free slots, ${bookedRanges.length} bookings`);
     }
 
-    // Step 12: Take screenshot
     await screenshot(page, 'debug-availability.png');
 
-    const totalWorking = practitionersOut.length;
-    console.log(`[Availability] Working practitioners: ${totalWorking}`);
-    practitionersOut.forEach(p => {
-      console.log(`  ${p.name}: ${p.available_slots.length} free slots, ${p.booked_slots.length} bookings`);
-    });
-
-    // Step 13: Return clean structured result
     res.json({
       success: true,
       date,
       practitioners: practitionersOut,
-      total_practitioners_working: totalWorking,
-      message: `Found ${totalWorking} practitioner${totalWorking !== 1 ? 's' : ''} working on ${date}`,
+      total_practitioners_working: practitionersOut.length,
+      message: `Found ${practitionersOut.length} practitioner${practitionersOut.length !== 1 ? 's' : ''} working on ${date}`,
     });
   } catch (err) {
     console.error('[Availability] ERROR:', err.message);
