@@ -1,10 +1,8 @@
 require('dotenv').config();
-
 const express = require('express');
 const cors = require('cors');
 const { chromium } = require('playwright');
 const path = require('path');
-
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -12,15 +10,12 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const EMAIL = process.env.CLINICSENSE_EMAIL;
 const PASSWORD = process.env.CLINICSENSE_PASSWORD;
-
 const LOGIN_URL = 'https://clinicsense.com/login/';
 const CALENDAR_URL = 'https://clinicsense.com/dashboard/calendar/';
 const TIMEOUT = 30000;
 
-// ─── Browser Singleton ───────────────────────────────────────────────────────
-
+// âââ Browser Singleton âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 let browserInstance = null;
-
 async function getBrowser() {
   if (!browserInstance || !browserInstance.isConnected()) {
     console.log('[Browser] Launching new Chromium browser...');
@@ -45,92 +40,144 @@ async function newPage() {
   return { page, context };
 }
 
-// ─── Login Helper ─────────────────────────────────────────────────────────────
+// âââ Availability Session Cache âââââââââââââââââââââââââââââââââââââââââââââââ
+// Keep ONE persistent logged-in Playwright context/page for /check-availability
+// so we don't pay the ~15-second login cost on every request.
+// Subsequent requests only need to navigate the calendar â saving ~20s per call.
+let availSession = null; // { context, page }
 
+async function getAvailabilityPage() {
+  // Validate cached session
+  if (availSession) {
+    try {
+      const url = availSession.page.url();
+      if (url.length > 5 && !url.includes('/login')) {
+        console.log('[Session] Reusing cached availability session.');
+        return availSession.page;
+      }
+    } catch (e) {
+      console.log('[Session] Cached session check failed:', e.message);
+    }
+    // Stale â close it
+    await availSession.context.close().catch(() => {});
+    availSession = null;
+  }
+
+  // Build a fresh logged-in session
+  console.log('[Session] Creating new availability session (login required)...');
+  const browser = await getBrowser();
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 900 },
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  });
+  const page = await context.newPage();
+  page.setDefaultTimeout(TIMEOUT);
+  await login(page);
+  availSession = { context, page };
+  return page;
+}
+
+// âââ Login Helper âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function login(page) {
   console.log('[Login] Navigating to login page...');
   await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
   await page.waitForTimeout(2000);
   await screenshot(page, 'debug-login-page.png');
-
   console.log('[Login] Waiting for email field...');
   await page.waitForSelector('input[type="email"], input[name="email"], input[placeholder*="Email"], input[id*="email"]', { timeout: TIMEOUT });
-
   console.log('[Login] Typing email...');
   await page.fill('input[type="email"], input[name="email"], input[placeholder*="Email"], input[id*="email"]', EMAIL);
-
   console.log('[Login] Typing password...');
   await page.fill('input[type="password"], input[name="password"]', PASSWORD);
-
   console.log('[Login] Clicking LOGIN button...');
   await page.click('button[type="submit"], input[type="submit"], button:has-text("LOGIN"), button:has-text("Log in"), button:has-text("Sign in")');
-
   console.log('[Login] Waiting for navigation after login...');
   await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: TIMEOUT }).catch(() => {
     console.log('[Login] Navigation event not fired, continuing...');
   });
-
   // Extra wait to let the SPA fully initialise after redirect
   await page.waitForTimeout(5000);
   await screenshot(page, 'debug-login-result.png');
-
   // Confirm we are no longer on the login page
   const currentUrl = page.url();
   console.log(`[Login] Current URL after login: ${currentUrl}`);
-
   if (currentUrl.includes('/login')) {
-    throw new Error('Login failed — still on login page. Check credentials or network.');
+    throw new Error('Login failed â still on login page. Check credentials or network.');
   }
-
   console.log('[Login] Login successful!');
 }
 
-// ─── Screenshot Helper ────────────────────────────────────────────────────────
-
+// âââ Screenshot Helper ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 async function screenshot(page, filename) {
   const filepath = path.join(__dirname, filename);
   await page.screenshot({ path: filepath, fullPage: true });
   console.log(`[Screenshot] Saved: ${filepath}`);
 }
 
-// ─── ENDPOINT 1: GET /health ──────────────────────────────────────────────────
-
+// âââ ENDPOINT 1: GET /health ââââââââââââââââââââââââââââââââââââââââââââââââââ
 app.get('/health', (req, res) => {
   console.log('[Health] Health check OK');
   res.json({ status: 'ok' });
 });
 
-// ─── ENDPOINT 2: POST /check-availability ────────────────────────────────────
-
+// âââ ENDPOINT 2: POST /check-availability ââââââââââââââââââââââââââââââââââââ
 app.post('/check-availability', async (req, res) => {
-  const { date } = req.body;
+  // Strip leading '=' artifact that n8n injects when evaluating expressions
+  // e.g. n8n sends "=2026-03-31" â we strip to "2026-03-31"
+  const date = (req.body.date || '').replace(/^=/, '');
 
   if (!date) {
     return res.status(400).json({ success: false, error: 'Missing required field: date' });
   }
-
   console.log(`\n[Availability] Checking availability for date: ${date}`);
-  let context, page;
 
+  let page;
   try {
-    ({ page, context } = await newPage());
+    page = await getAvailabilityPage();
 
-    // Step 1-7: Login
-    await login(page);
-
-    // Step 8: Navigate to calendar page and wait for full SPA load
+    // Navigate to calendar. Already logged in, so this is fast.
+    // Detect readiness via the calendar API response instead of a fixed 8s delay.
     console.log('[Availability] Navigating to calendar page...');
+    const calReady = page.waitForResponse(
+      r => r.url().includes('/api/2/calendar/') && r.status() === 200,
+      { timeout: TIMEOUT }
+    ).catch(() => {});
     await page.goto(CALENDAR_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
-    await page.waitForTimeout(8000);
-    await screenshot(page, 'debug-availability-calendar.png');
+    await calReady;
+    await page.waitForTimeout(1000); // short buffer for SPA rendering
+
+    // If redirected to login the session expired â invalidate & retry once
+    if (page.url().includes('/login')) {
+      console.log('[Session] Session expired, re-authenticating...');
+      await availSession.context.close().catch(() => {});
+      availSession = null;
+      page = await getAvailabilityPage();
+      const calReady2 = page.waitForResponse(
+        r => r.url().includes('/api/2/calendar/') && r.status() === 200,
+        { timeout: TIMEOUT }
+      ).catch(() => {});
+      await page.goto(CALENDAR_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
+      await calReady2;
+      await page.waitForTimeout(1000);
+    }
+
     console.log(`[Availability] Calendar loaded. URL: ${page.url()}`);
 
-    // Step 9: Navigate to the requested date using calendar chevrons
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const target = new Date(date + 'T00:00:00');
-    const daysDiff = Math.round((target - today) / 86400000);
-    console.log(`[Availability] Days from today to ${date}: ${daysDiff}`);
+    // Use Calgary Mountain Time as the "today" reference so daysDiff is correct
+    // regardless of what timezone the Railway server runs in.
+    const todayMT = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Edmonton',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date());
+
+    const [ty, tm, td] = todayMT.split('-').map(Number);
+    const [dy, dm, dd] = date.split('-').map(Number);
+    const todayMs  = Date.UTC(ty, tm - 1, td);
+    const targetMs = Date.UTC(dy, dm - 1, dd);
+    const daysDiff = Math.round((targetMs - todayMs) / 86400000);
+
+    console.log(`[Availability] Today (MT): ${todayMT}, target: ${date}, diff: ${daysDiff}`);
 
     if (daysDiff !== 0) {
       const arrowCls = daysDiff > 0
@@ -140,16 +187,16 @@ app.post('/check-availability', async (req, res) => {
         await page.evaluate((cls) => { document.querySelector(cls)?.click(); }, arrowCls);
         await page.waitForTimeout(800);
       }
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(1000);
       await screenshot(page, 'debug-availability-target-date.png');
       console.log('[Availability] Navigated to target date.');
     }
 
-    // Step 10: Parse all data from DOM — no API calls needed
+    // Step 10: Parse all data from DOM â no API calls needed
     console.log('[Availability] Parsing calendar DOM...');
     const calendarData = await page.evaluate(() => {
-      // ── A. Parse practitioner schedule from text header ──────────────────────
-      const UI_SKIP = /^(CALENDAR|CLIENTS|SELL|COMMUNICATION|REPORTS|SETUP|WAIT LIST|Location|Practitioners|Office staff|Services|Treatment|Form|Scheduling|Payment|Reminders|Notification|Auto|Change|Perks|Logout|TODAY|Switch|Print|Hide|ZOOM|LINK|Schedule|VIP|★)/i;
+      // ââ A. Parse practitioner schedule from text header ââââââââââââââââââââââ
+      const UI_SKIP = /^(CALENDAR|CLIENTS|SELL|COMMUNICATION|REPORTS|SETUP|WAIT LIST|Location|Practitioners|Office staff|Services|Treatment|Form|Scheduling|Payment|Reminders|Notification|Auto|Change|Perks|Logout|TODAY|Switch|Print|Hide|ZOOM|LINK|Schedule|VIP|â)/i;
       const bodyText = document.body.innerText;
       const headerSection = bodyText.split(/12AM\n12:15AM/)[0];
       const lines = headerSection.split('\n').map(l => l.trim()).filter(Boolean);
@@ -170,8 +217,7 @@ app.post('/check-availability', async (req, res) => {
           idx += 4;
         } else { idx++; }
       }
-
-      // ── B. Find each working practitioner's column x-position from the DOM ──
+      // ââ B. Find each working practitioner's column x-position from the DOM ââ
       for (const prac of practitioners.filter(p => p.working)) {
         const nameNorm = prac.name.toUpperCase().replace(/\s+/g, ' ').trim();
         for (const el of document.querySelectorAll('*')) {
@@ -186,12 +232,10 @@ app.post('/check-availability', async (req, res) => {
           }
         }
       }
-
-      // ── C. Calibrate time grid: map pixel y-positions to clock times ─────────
+      // ââ C. Calibrate time grid: map pixel y-positions to clock times âââââââââ
       const timeLabels = [];
       for (const el of document.querySelectorAll('*')) {
         const txt = (el.innerText || '').trim();
-        // Match labels like "7AM", "8AM", "1PM" etc.
         const m = txt.match(/^(\d{1,2})(AM|PM)$/i);
         if (!m) continue;
         const r = el.getBoundingClientRect();
@@ -199,13 +243,11 @@ app.post('/check-availability', async (req, res) => {
         let h = parseInt(m[1]);
         if (m[2].toUpperCase() === 'PM' && h !== 12) h += 12;
         if (m[2].toUpperCase() === 'AM' && h === 12) h = 0;
-        // Deduplicate (same hour may appear multiple times)
         if (!timeLabels.some(t => Math.abs(t.mins - h * 60) < 30 && Math.abs(t.y - r.top) < 5)) {
           timeLabels.push({ mins: h * 60, y: r.top });
         }
       }
       timeLabels.sort((a, b) => a.y - b.y);
-
       let pxPerMin = null, refLabel = null;
       if (timeLabels.length >= 2) {
         const first = timeLabels[0];
@@ -215,13 +257,11 @@ app.post('/check-availability', async (req, res) => {
           refLabel = first;
         }
       }
-
-      // ── D. Parse booked appointment blocks from the calendar grid ────────────
+      // ââ D. Parse booked appointment blocks from the calendar grid ââââââââââââ
       const appointments = [];
       const eventEls = document.querySelectorAll(
         '.calendar-event, .calendar-appointment, [class*="calendar-event"], [class*="appt"], [class*="appointment"]'
       );
-
       const parseTime12 = (str) => {
         const m = str.trim().match(/(\d{1,2}):(\d{2})\s?(AM|PM)/i);
         if (!m) return null;
@@ -231,16 +271,12 @@ app.post('/check-availability', async (req, res) => {
         if (m[3].toUpperCase() === 'AM' && h === 12) h = 0;
         return h * 60 + min;
       };
-
       for (const el of eventEls) {
         const r = el.getBoundingClientRect();
         if (r.width === 0 || r.height === 0 || r.top < 100) continue;
         const text = (el.innerText || '').trim();
         const elX  = Math.round(r.left + r.width / 2);
-
         let startMins = null, endMins = null;
-
-        // Strategy 1: extract HH:MM AM/PM times from visible text
         const timeMatches = [...text.matchAll(/(\d{1,2}:\d{2}\s?(?:AM|PM))/gi)].map(x => x[1]);
         if (timeMatches.length >= 2) {
           startMins = parseTime12(timeMatches[0]);
@@ -249,21 +285,16 @@ app.post('/check-availability', async (req, res) => {
           startMins = parseTime12(timeMatches[0]);
           if (startMins !== null && pxPerMin) endMins = startMins + Math.round(r.height / pxPerMin);
         }
-
-        // Strategy 2: use CSS y-position relative to calibrated time grid
         if (startMins === null && pxPerMin && refLabel) {
-          startMins = Math.round(refLabel.mins + (r.top  - refLabel.y) / pxPerMin);
+          startMins = Math.round(refLabel.mins + (r.top    - refLabel.y) / pxPerMin);
           endMins   = Math.round(refLabel.mins + (r.bottom - refLabel.y) / pxPerMin);
-          // Round to nearest 15 min
           startMins = Math.round(startMins / 15) * 15;
           endMins   = Math.round(endMins   / 15) * 15;
         }
-
         if (startMins !== null && endMins !== null && endMins > startMins) {
           appointments.push({ text: text.substring(0, 120), x: elX, startMins, endMins });
         }
       }
-
       return {
         practitioners,
         appointments,
@@ -275,7 +306,7 @@ app.post('/check-availability', async (req, res) => {
       `${calendarData.appointments.length} appointments found. ` +
       `pxPerMin=${calendarData.debug.pxPerMin?.toFixed(2)}, timeLabels=${calendarData.debug.timeLabelsCount}`);
 
-    // ── Time helpers ───────────────────────────────────────────────────────────
+    // ââ Time helpers âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     const toMinutes = (timeStr) => {
       if (!timeStr) return null;
       timeStr = String(timeStr).trim();
@@ -290,7 +321,6 @@ app.post('/check-availability', async (req, res) => {
       if (ampm === 'AM' && h === 12) h = 0;
       return h * 60 + min;
     };
-
     const fromMinutes = (mins) => {
       const h24 = Math.floor(mins / 60);
       const m   = mins % 60;
@@ -299,40 +329,35 @@ app.post('/check-availability', async (req, res) => {
       return `${h12}:${String(m).padStart(2, '0')} ${ampm}`;
     };
 
-    // ── Step 11: Match appointments to practitioners by column x-position ──────
+    // ââ Step 11: Match appointments to practitioners by column x-position ââââââ
     const workingPractitioners = calendarData.practitioners.filter(p => p.working && p.start && p.end);
     console.log(`[Availability] Working practitioners: ${workingPractitioners.length}`);
     workingPractitioners.forEach(p => console.log(`  ${p.name} | ${p.start} - ${p.end} | colX=${p.colX}`));
 
-    // Build booked ranges per practitioner
     const bookedByPrac = {};
     for (const appt of calendarData.appointments) {
       if (workingPractitioners.length === 0) break;
-      // Find the working practitioner whose column x is closest to this appointment's x
       let bestPrac = null, bestDist = Infinity;
       for (const prac of workingPractitioners) {
         if (prac.colX === null) continue;
         const dist = Math.abs(prac.colX - appt.x);
         if (dist < bestDist) { bestDist = dist; bestPrac = prac; }
       }
-      // Only assign if within 200px (avoids wild mismatches)
       if (bestPrac && bestDist < 200) {
         if (!bookedByPrac[bestPrac.name]) bookedByPrac[bestPrac.name] = [];
         bookedByPrac[bestPrac.name].push(appt);
       }
     }
 
-    // ── Step 12: Build per-practitioner output ────────────────────────────────
+    // ââ Step 12: Build per-practitioner output ââââââââââââââââââââââââââââââââ
     const practitionersOut = [];
     for (const prac of workingPractitioners) {
       const startMin  = toMinutes(prac.start);
       const endMin    = toMinutes(prac.end);
       const bookings  = bookedByPrac[prac.name] || [];
-
       const bookedRanges = bookings
         .map(b => ({ start: b.startMins, end: b.endMins, text: b.text }))
         .filter(r => r.start !== null && r.end !== null);
-
       const freeSlots = [];
       if (startMin !== null && endMin !== null) {
         for (let t = startMin; t + 60 <= endMin; t += 60) {
@@ -341,7 +366,6 @@ app.post('/check-availability', async (req, res) => {
           if (!blocked) freeSlots.push(fromMinutes(t));
         }
       }
-
       practitionersOut.push({
         name:            prac.name,
         hours:           `${prac.start} - ${prac.end}`,
@@ -351,12 +375,10 @@ app.post('/check-availability', async (req, res) => {
           info: r.text,
         })),
       });
-
       console.log(`  ${prac.name}: ${freeSlots.length} free slots, ${bookedRanges.length} bookings`);
     }
 
     await screenshot(page, 'debug-availability.png');
-
     res.json({
       success: true,
       date,
@@ -364,17 +386,21 @@ app.post('/check-availability', async (req, res) => {
       total_practitioners_working: practitionersOut.length,
       message: `Found ${practitionersOut.length} practitioner${practitionersOut.length !== 1 ? 's' : ''} working on ${date}`,
     });
+
   } catch (err) {
     console.error('[Availability] ERROR:', err.message);
+    // Invalidate the cached session on error so next request gets a fresh one
+    if (availSession) {
+      await availSession.context.close().catch(() => {});
+      availSession = null;
+    }
     if (page) await screenshot(page, 'debug-availability.png').catch(() => {});
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (context) await context.close().catch(() => {});
   }
+  // NOTE: Do NOT close the context here â we keep it alive for the next request.
 });
 
-// ─── ENDPOINT 3: POST /create-booking ────────────────────────────────────────
-
+// âââ ENDPOINT 3: POST /create-booking ââââââââââââââââââââââââââââââââââââââââ
 // Helper: find visible element by exact innerText and return its center coord + bottom
 async function findVisibleByText(page, text) {
   return page.evaluate((t) => {
@@ -391,8 +417,6 @@ async function findVisibleByText(page, text) {
 }
 
 // Helper: select a value from a dropdown that just opened.
-// minY = minimum y-coordinate (items BELOW the spinner row).
-// nearX = if provided, only click items within ±80px of this x (keeps us in the open dropdown column).
 async function selectDropdownValue(page, value, minY = 200, nearX = null) {
   return page.evaluate(({ v, minY, nearX }) => {
     for (const el of document.querySelectorAll('*')) {
@@ -409,7 +433,7 @@ async function selectDropdownValue(page, value, minY = 200, nearX = null) {
 
 app.post('/create-booking', async (req, res) => {
   const {
-    date,
+    date: rawDate,
     time,
     clientFirstName,
     clientLastName,
@@ -419,22 +443,19 @@ app.post('/create-booking', async (req, res) => {
     duration,
     therapist,
   } = req.body;
-
+  // Strip leading '=' artifact from n8n expression evaluation
+  const date = (rawDate || '').replace(/^=/, '');
   const required = { date, time, clientFirstName, clientLastName };
   for (const [key, val] of Object.entries(required)) {
     if (!val) return res.status(400).json({ success: false, error: `Missing required field: ${key}` });
   }
-
   console.log(`\n[Booking] Creating booking for ${clientFirstName} ${clientLastName} on ${date} at ${time}`);
   let context, page;
-
   try {
     ({ page, context } = await newPage());
-
-    // ── Step 1: Login ────────────────────────────────────────────────────────
+    // ââ Step 1: Login ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     await login(page);
-
-    // ── Step 2: Navigate to calendar and wait for SPA to load ────────────────
+    // ââ Step 2: Navigate to calendar and wait for SPA to load ââââââââââââââââ
     console.log('[Booking] Navigating to calendar...');
     const calReady = page.waitForResponse(
       r => r.url().includes('/api/2/calendar/') && r.status() === 200,
@@ -443,16 +464,11 @@ app.post('/create-booking', async (req, res) => {
     await page.goto(CALENDAR_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
     await calReady;
     await page.waitForTimeout(2000);
-
-    // ── Step 3: Click the "+" FAB then "Schedule New Appointment" popup ───────
-    // The FAB is <span class="linearicon-plus">. Clicking it opens a welcome popup.
-    // Inside the popup, "Schedule New Appointment" opens the booking form.
+    // ââ Step 3: Click the "+" FAB then "Schedule New Appointment" popup âââââââ
     console.log('[Booking] Opening new appointment form...');
     await page.waitForSelector('.linearicon-plus', { timeout: TIMEOUT });
     await page.click('.linearicon-plus');
     await page.waitForTimeout(2000);
-
-    // Click "Schedule New Appointment" inside the popup (find by exact innerText)
     await page.evaluate(() => {
       for (const el of document.querySelectorAll('*')) {
         if ((el.innerText || '').trim() === 'Schedule New Appointment') { el.click(); return; }
@@ -462,35 +478,25 @@ app.post('/create-booking', async (req, res) => {
     await page.waitForTimeout(500);
     console.log('[Booking] New appointment form opened.');
     await screenshot(page, 'debug-booking-step1-form.png');
-
-    // ── Step 4: Client search ─────────────────────────────────────────────────
-    // ClinicSense uses an autocomplete search — type name, select from dropdown.
-    // If not found, click "+ Add new client" and fill the new client form.
+    // ââ Step 4: Client search âââââââââââââââââââââââââââââââââââââââââââââââââ
     console.log(`[Booking] Searching for client: ${clientFirstName} ${clientLastName}`);
     const fullName = `${clientFirstName} ${clientLastName}`;
     await page.fill('input[placeholder*="Search for a client by name"]', fullName);
     await page.waitForTimeout(2000);
     await screenshot(page, 'debug-booking-step2-client-search.png');
-
-    // Try to click the exact matching client name in the dropdown
     let clientFound = false;
     try {
       await page.locator(`text=${fullName}`).first().click({ timeout: 5000 });
       clientFound = true;
       console.log('[Booking] Existing client selected.');
     } catch (_) {}
-
     if (!clientFound) {
-      // Client not in system — click "+ Add new client"
-      console.log('[Booking] Client not found — adding new client...');
+      console.log('[Booking] Client not found â adding new client...');
       const addLink = await findVisibleByText(page, '+ Add new client');
       if (addLink) {
         await page.mouse.click(addLink.x, addLink.y);
         await page.waitForTimeout(2000);
         await screenshot(page, 'debug-booking-step3-new-client.png');
-
-        // The new client form appears — fill first/last name, email, phone
-        // ClinicSense new client form uses placeholder-based inputs
         const fieldMap = [
           ['input[placeholder*="First" i]',  clientFirstName],
           ['input[placeholder*="Last" i]',   clientLastName],
@@ -502,8 +508,6 @@ app.post('/create-booking', async (req, res) => {
           const el = await page.$(sel);
           if (el) { await el.fill(val); console.log(`[Booking] New client field filled: ${val}`); }
         }
-
-        // Save the new client (look for a "Save" / "Add" button in the client section)
         await page.evaluate(() => {
           for (const el of document.querySelectorAll('button, [role="button"]')) {
             const txt = (el.innerText || '').trim().toLowerCase();
@@ -515,26 +519,17 @@ app.post('/create-booking', async (req, res) => {
         console.log('[Booking] "+ Add new client" link not found, continuing...');
       }
     }
-
     await screenshot(page, 'debug-booking-step4-after-client.png');
-
-    // ── Step 5: Select service (custom Vue dropdown) ──────────────────────────
-    // The service dropdown shows a list of services, each with duration buttons
-    // (60 MIN, 90 MIN, 120 MIN). Click the service name row, then the duration.
+    // ââ Step 5: Select service ââââââââââââââââââââââââââââââââââââââââââââââââ
     if (service) {
       console.log(`[Booking] Selecting service: ${service} (${duration || '60'} min)`);
-
-      // Find and click the "Select service" dropdown
       const svcDropdown = await findVisibleByText(page, 'Select service');
       if (svcDropdown) {
         await page.mouse.click(svcDropdown.x, svcDropdown.y);
         await page.waitForTimeout(1500);
         await screenshot(page, 'debug-booking-step5-service-open.png');
-
-        // Find service by partial name match, then click its duration button
         const svcClicked = await page.evaluate(({ svcName, dur }) => {
           const allEls = [...document.querySelectorAll('*')];
-          // Find the service name element (partial match, short text, no newlines)
           let serviceEl = null;
           for (const el of allEls) {
             const txt = (el.innerText || '').trim().toLowerCase();
@@ -544,8 +539,6 @@ app.post('/create-booking', async (req, res) => {
             }
           }
           if (!serviceEl) return { error: `Service "${svcName}" not found` };
-
-          // Find the duration button (e.g. "60 MIN") closest BELOW the service name
           const durText = dur + ' MIN';
           let closestBtn = null, closestDist = Infinity;
           for (const el of allEls) {
@@ -558,7 +551,6 @@ app.post('/create-booking', async (req, res) => {
             }
           }
           if (!closestBtn) {
-            // Fallback: just click first visible duration button below service
             for (const el of allEls) {
               const r = el.getBoundingClientRect();
               if (r.top > serviceEl.y && r.top < serviceEl.y + 120 && r.width > 20 && r.height > 0) {
@@ -570,163 +562,107 @@ app.post('/create-booking', async (req, res) => {
           if (closestBtn) { closestBtn.click(); return { success: true }; }
           return { error: `Duration "${durText}" not found below service` };
         }, { svcName: service, dur: String(duration || '60') });
-
         console.log('[Booking] Service click result:', JSON.stringify(svcClicked));
         await page.waitForTimeout(1500);
         await screenshot(page, 'debug-booking-step5-after-service.png');
       }
     }
-
-    // ── Step 6: Select practitioner ───────────────────────────────────────────
-    // Custom dropdown — click to open, then find the practitioner name in the
-    // list (which appears below the dropdown button). Filter by: no newlines in
-    // the text (excludes calendar headers), text matches therapist name.
+    // ââ Step 6: Select practitioner âââââââââââââââââââââââââââââââââââââââââââ
     if (therapist) {
       console.log(`[Booking] Selecting practitioner: ${therapist}`);
-
       const pracDropdown = await findVisibleByText(page, 'Select practitioner');
       if (pracDropdown) {
         await page.mouse.click(pracDropdown.x, pracDropdown.y);
         await page.waitForTimeout(1500);
         await screenshot(page, 'debug-booking-step6-prac-open.png');
-
-        // Find practitioner in the dropdown list (below the dropdown, no newlines)
         const pracClicked = await page.evaluate(({ dropY, name }) => {
           for (const el of document.querySelectorAll('*')) {
             const txt = (el.innerText || '').trim();
-            if (
-              txt.toLowerCase().includes(name.toLowerCase()) &&
-              !txt.includes('\n') &&
-              txt.length < 80
-            ) {
+            if (txt.toLowerCase().includes(name.toLowerCase()) && !txt.includes('\n') && txt.length < 80) {
               const r = el.getBoundingClientRect();
-              if (r.top > dropY && r.width > 50 && r.height > 0) {
-                el.click();
-                return { clicked: txt };
-              }
+              if (r.top > dropY && r.width > 50 && r.height > 0) { el.click(); return { clicked: txt }; }
             }
           }
           return { error: `Practitioner "${name}" not found in dropdown` };
         }, { dropY: pracDropdown.bottom, name: therapist });
-
         console.log('[Booking] Practitioner click result:', JSON.stringify(pracClicked));
         await page.waitForTimeout(1500);
         await screenshot(page, 'debug-booking-step6-after-prac.png');
       }
     }
-
-    // ── Step 7: Set date ──────────────────────────────────────────────────────
-    // The date field shows the current date as pre-filled text.
-    // Clicking the INPUT element opens a calendar picker overlay.
-    // Use page.mouse.click() to bypass BOX-flex-manager pointer intercepts.
+    // ââ Step 7: Set date ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     console.log(`[Booking] Setting date to: ${date}`);
     const targetDay = parseInt(date.split('-')[2], 10);
-
-    // Get the date input's actual position
     const dateInputPos = await page.evaluate(() => {
       const input = document.querySelector('input[placeholder*="Select a date"]');
       const r = input?.getBoundingClientRect();
       return r ? { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), bottom: Math.round(r.bottom) } : null;
     });
-
     if (dateInputPos) {
       await page.mouse.click(dateInputPos.x, dateInputPos.y);
       await page.waitForTimeout(1200);
       await screenshot(page, 'debug-booking-step7-datepicker.png');
-
-      // Click the target day in the calendar picker.
-      // Strategy: find the calendar picker container first by locating the month/year
-      // header text (e.g. "March 2026"), then search for the day number WITHIN it.
-      // This avoids matching "29" from other page elements (appointments, time grid, etc.)
       for (let attempt = 0; attempt < 6; attempt++) {
         const dayClicked = await page.evaluate(({ day, inputBottom, inputRight }) => {
-          // Step 1: find the month header element visible in the picker area
-          // (something like "March 2026" positioned below the date input)
           let pickerRoot = null;
           for (const el of document.querySelectorAll('*')) {
             const txt = (el.innerText || '').trim();
             const r = el.getBoundingClientRect();
             if (/^[A-Za-z]+ \d{4}$/.test(txt) && r.top > inputBottom - 60 && r.top < inputBottom + 200) {
-              // Walk up to find the calendar container (a reasonably-sized ancestor)
               let ancestor = el.parentElement;
               for (let i = 0; i < 8 && ancestor; i++) {
                 const ar = ancestor.getBoundingClientRect();
                 if (ar.width > 100 && ar.height > 100) { pickerRoot = ancestor; break; }
                 ancestor = ancestor.parentElement;
               }
-              if (!pickerRoot) pickerRoot = el.parentElement;
+      2       if (!pickerRoot) pickerRoot = el.parentElement;
               break;
             }
           }
-
-          // Step 2: search for the day number within the picker, or fallback to
-          // small-cell elements below the date input
           const searchRoot = pickerRoot || document;
           const candidates = [...searchRoot.querySelectorAll('*')];
           for (const el of candidates) {
             const txt = (el.innerText || '').trim();
             if (txt !== String(day)) continue;
             const r = el.getBoundingClientRect();
-            // The day cell should be small (25-60px), below the input, and near the picker x range
-            if (
-              r.top > inputBottom - 10 &&
-              r.width >= 20 && r.width <= 70 &&
-              r.height >= 18 && r.height <= 70 &&
-              r.left >= 0 && r.left <= 1280
-            ) {
+            if (r.top > inputBottom - 10 && r.width >= 20 && r.width <= 70 && r.height >= 18 && r.height <= 70 && r.left >= 0 && r.left <= 1280) {
               el.click();
               return { x: Math.round(r.left), y: Math.round(r.top), inPicker: !!pickerRoot };
             }
           }
           return null;
         }, { day: targetDay, inputBottom: dateInputPos.bottom, inputRight: dateInputPos.x + 140 });
-
         if (dayClicked) {
           console.log(`[Booking] Day ${targetDay} clicked at:`, JSON.stringify(dayClicked));
           break;
         }
-
-        // Navigate to next month if day not visible
         const nextClicked = await page.evaluate(({ inputBottom }) => {
           for (const el of document.querySelectorAll('*')) {
             const txt = (el.innerText || '').trim();
             const r = el.getBoundingClientRect();
-            if ((txt === '›' || txt === '>') && r.top > inputBottom - 30) { el.click(); return true; }
+            if ((txt === 'âº' || txt === '>') && r.top > inputBottom - 30) { el.click(); return true; }
           }
           return false;
         }, { inputBottom: dateInputPos.bottom });
-
         if (!nextClicked) break;
         await page.waitForTimeout(500);
       }
       await page.waitForTimeout(1000);
-      // Press Escape to close the date picker overlay if still open,
-      // then click a neutral spot so no dropdown remains open before step 8.
       await page.keyboard.press('Escape');
       await page.waitForTimeout(400);
     }
-
     await screenshot(page, 'debug-booking-step7-after-date.png');
-
-    // ── Step 8: Set start time ─────────────────────────────────────────────────
-    // ClinicSense uses 3 custom spinner dropdowns: Hour / Minute / AM-PM.
-    // Each spinner opens a dropdown when clicked via page.mouse.click().
-    // Minute options are quarter-hour: 00, 15, 30, 45.
+    // ââ Step 8: Set start time âââââââââââââââââââââââââââââââââââââââââââââââââ
     console.log(`[Booking] Setting start time: ${time}`);
     const timeMatch = time.match(/(\d{1,2}):(\d{2})\s?(AM|PM)/i);
     if (timeMatch) {
-      const tHour  = String(parseInt(timeMatch[1], 10)); // "02" → "2"
+      const tHour  = String(parseInt(timeMatch[1], 10));
       const tAmpm  = timeMatch[3].toUpperCase();
-      // Round minute to nearest quarter-hour option
       const rawMin   = parseInt(timeMatch[2], 10);
       const minOpts  = [0, 15, 30, 45];
       const rounded  = minOpts.reduce((a, b) => Math.abs(b - rawMin) < Math.abs(a - rawMin) ? b : a);
       const tMin     = String(rounded).padStart(2, '0');
-
-      console.log(`[Booking] Parsed time → hour=${tHour}, min=${tMin}, ampm=${tAmpm}`);
-
-      // Find the 3 start-time spinners within the [data-cs_field_name="start_time"] container.
-      // Filter for BOX-flex-manager divs with width 60-85px, cluster by x separation > 50px.
+      console.log(`[Booking] Parsed time â hour=${tHour}, min=${tMin}, ampm=${tAmpm}`);
       const spinnerCoords = await page.evaluate(() => {
         const container = document.querySelector('[data-cs_field_name="start_time"]');
         if (!container) return [];
@@ -735,11 +671,7 @@ app.post('/create-booking', async (req, res) => {
           const r = el.getBoundingClientRect();
           return r.width >= 60 && r.width <= 90 && r.height >= 25 && r.height <= 55 && r.top > cr.top + 5;
         });
-        // Get all left-edge x values, sort ascending
-        const xVals = candidates
-          .map(el => Math.round(el.getBoundingClientRect().left))
-          .sort((a, b) => a - b);
-        // Cluster: only keep values that are >50px apart from the previous kept value
+        const xVals = candidates.map(el => Math.round(el.getBoundingClientRect().left)).sort((a, b) => a - b);
         const clusters = [];
         for (const x of xVals) {
           if (clusters.length === 0 || x - clusters[clusters.length - 1] > 50) clusters.push(x);
@@ -752,27 +684,19 @@ app.post('/create-booking', async (req, res) => {
           return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
         }).filter(Boolean);
       });
-
       console.log('[Booking] Start time spinner coords:', JSON.stringify(spinnerCoords));
-
       if (spinnerCoords.length >= 3) {
         const [hourSpinner, minSpinner, ampmSpinner] = spinnerCoords;
-
-        // ── Hour ──────────────────────────────────────────────────────────────
         await page.mouse.click(hourSpinner.x, hourSpinner.y);
         await page.waitForTimeout(800);
         const hourOk = await selectDropdownValue(page, tHour, hourSpinner.y + 20, hourSpinner.x);
         console.log(`[Booking] Hour ${tHour} selected:`, hourOk);
         await page.waitForTimeout(500);
-
-        // ── Minute ────────────────────────────────────────────────────────────
         await page.mouse.click(minSpinner.x, minSpinner.y);
         await page.waitForTimeout(800);
         const minOk = await selectDropdownValue(page, tMin, minSpinner.y + 20, minSpinner.x);
         console.log(`[Booking] Minute ${tMin} selected:`, minOk);
         await page.waitForTimeout(500);
-
-        // ── AM/PM ─────────────────────────────────────────────────────────────
         await page.mouse.click(ampmSpinner.x, ampmSpinner.y);
         await page.waitForTimeout(800);
         const ampmOk = await selectDropdownValue(page, tAmpm, ampmSpinner.y + 20, ampmSpinner.x);
@@ -782,13 +706,9 @@ app.post('/create-booking', async (req, res) => {
         console.log(`[Booking] WARNING: only ${spinnerCoords.length} spinners found (expected 3)`);
       }
     }
-
     await page.waitForTimeout(1000);
     await screenshot(page, 'debug-booking-step8-before-save.png');
-
-    // ── Step 9: Save & Close ──────────────────────────────────────────────────
-    // The SAVE & CLOSE button is at the bottom of the modal (y > 800).
-    // Use mouse.click to bypass BOX-flex-manager pointer intercepts.
+    // ââ Step 9: Save & Close ââââââââââââââââââââââââââââââââââââââââââââââââââ
     console.log('[Booking] Clicking SAVE & CLOSE...');
     const saveCoord = await page.evaluate(() => {
       for (const el of document.querySelectorAll('*')) {
@@ -800,21 +720,15 @@ app.post('/create-booking', async (req, res) => {
       }
       return null;
     });
-
     if (saveCoord) {
       await page.mouse.click(saveCoord.x, saveCoord.y);
     } else {
-      // Fallback: try Playwright locator
       await page.locator('text=SAVE & CLOSE').last().click({ timeout: TIMEOUT });
     }
-
     await page.waitForTimeout(4000);
     await screenshot(page, 'debug-booking.png');
-
-    // Verify success: the modal should have closed (check for it)
     const modalStillOpen = await page.$('input[placeholder*="Search for a client by name"]');
     if (modalStillOpen) {
-      // Modal still open — check for error messages
       const errorText = await page.evaluate(() => {
         for (const el of document.querySelectorAll('*')) {
           const txt = (el.innerText || '').trim();
@@ -825,9 +739,7 @@ app.post('/create-booking', async (req, res) => {
         return null;
       });
       if (errorText) throw new Error(`Form validation error: ${errorText}`);
-      // If no error but modal open, maybe it saved successfully as a draft
     }
-
     console.log('[Booking] Booking complete!');
     res.json({
       success: true,
@@ -843,31 +755,18 @@ app.post('/create-booking', async (req, res) => {
   }
 });
 
-// ─── ENDPOINT 4: POST /cancel-booking ────────────────────────────────────────
-// Cancels an appointment by navigating to the target date in the calendar,
-// clicking the appointment block to open its edit form, then clicking
-// "CANCEL APPOINTMENT" → "CONFIRM CANCELLATION".
-//
-// Required body: { date, time, clientName }
-//   date       – "YYYY-MM-DD"
-//   time       – "H:MM AM/PM"  (used to match the appointment when clientName is ambiguous)
-//   clientName – partial or full client name (case-insensitive)
-
+// âââ ENDPOINT 4: POST /cancel-booking ââââââââââââââââââââââââââââââââââââââââ
 app.post('/cancel-booking', async (req, res) => {
-  const { date, time, clientName } = req.body;
-
+  const { date: rawDate, time, clientName } = req.body;
+  const date = (rawDate || '').replace(/^=/, '');
   if (!date || !time) {
     return res.status(400).json({ success: false, error: 'Missing required fields: date, time' });
   }
-
   console.log(`\n[Cancel] Cancelling booking on ${date} at ${time} for ${clientName || 'unknown client'}`);
   let context, page;
-
   try {
     ({ page, context } = await newPage());
     await login(page);
-
-    // ── Step 1: Load today's calendar (wait for SPA + API) ─────────────────
     console.log('[Cancel] Loading calendar...');
     const calApiDone = page.waitForResponse(
       r => r.url().includes('/api/2/calendar/') && r.status() === 200,
@@ -876,34 +775,22 @@ app.post('/cancel-booking', async (req, res) => {
     await page.goto(CALENDAR_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
     await calApiDone;
     await page.waitForTimeout(2000);
-
-    // ── Step 2: Navigate to target date ────────────────────────────────────
-    // Calculate days difference between today and the target date.
-    // Use the "previous/next day" chevron icons in the calendar header.
-    const todayStr = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+    const todayStr = new Date().toISOString().slice(0, 10);
     const [ty, tm, td] = todayStr.split('-').map(Number);
     const [gy, gm, gd] = date.split('-').map(Number);
     const todayMs  = Date.UTC(ty, tm - 1, td);
     const targetMs = Date.UTC(gy, gm - 1, gd);
     const daysDiff = Math.round((targetMs - todayMs) / 86400000);
-
     console.log(`[Cancel] Today: ${todayStr}, target: ${date}, diff: ${daysDiff} days`);
-
     if (daysDiff !== 0) {
-      const arrowCls = daysDiff > 0
-        ? '.linearicon-chevron-right-circle'   // forward in time
-        : '.linearicon-chevron-left-circle';   // backward in time
+      const arrowCls = daysDiff > 0 ? '.linearicon-chevron-right-circle' : '.linearicon-chevron-left-circle';
       const steps = Math.abs(daysDiff);
-
       for (let i = 0; i < steps; i++) {
         const calNext = page.waitForResponse(
           r => r.url().includes('/api/2/calendar/') && r.status() === 200,
           { timeout: 15000 }
         ).catch(() => {});
-        await page.evaluate((cls) => {
-          const el = document.querySelector(cls);
-          if (el) el.click();
-        }, arrowCls);
+        await page.evaluate((cls) => { const el = document.querySelector(cls); if (el) el.click(); }, arrowCls);
         await calNext;
         await page.waitForTimeout(600);
       }
@@ -911,15 +798,10 @@ app.post('/cancel-booking', async (req, res) => {
     await page.waitForTimeout(1500);
     console.log(`[Cancel] Navigated to ${date}`);
     await screenshot(page, 'debug-cancel-step1-date.png');
-
-    // ── Step 3: Use API to find the appointment ─────────────────────────────
-    // Identify the appointment we need to cancel by client name + time.
     const apptInfo = await page.evaluate(async ({ targetDate, clientNameQ, timeStr }) => {
       const resp = await fetch(`/api/2/calendar/?mode=day&exact_date=${targetDate}&format=json`, { credentials: 'include' });
       const data  = await resp.json();
       const appts = data.appointments || [];
-
-      // Convert "H:MM AM/PM" → "HH:MM:SS" for comparison
       const toH24 = (t) => {
         const m = t.match(/(\d{1,2}):(\d{2})\s?(AM|PM)/i);
         if (!m) return null;
@@ -929,14 +811,11 @@ app.post('/cancel-booking', async (req, res) => {
         return `${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
       };
       const target24 = toH24(timeStr);
-
-      // Match by client name (partial, case-insensitive) and start_time
       for (const a of appts) {
         const nameMatch = !clientNameQ || (a.client_name || '').toLowerCase().includes(clientNameQ.toLowerCase());
         const timeMatch = !target24  || (a.start_time || '').startsWith(target24.slice(0, 5));
         if (nameMatch && timeMatch) return { id: a.id, name: a.client_name, start: a.start_time };
       }
-      // Fallback: match by name only
       for (const a of appts) {
         if (!clientNameQ) return { id: a.id, name: a.client_name, start: a.start_time };
         if ((a.client_name || '').toLowerCase().includes(clientNameQ.toLowerCase()))
@@ -944,14 +823,8 @@ app.post('/cancel-booking', async (req, res) => {
       }
       return null;
     }, { targetDate: date, clientNameQ: clientName || '', timeStr: time });
-
-    if (!apptInfo) {
-      throw new Error(`No appointment found on ${date} for "${clientName}" at ${time}`);
-    }
+    if (!apptInfo) throw new Error(`No appointment found on ${date} for "${clientName}" at ${time}`);
     console.log(`[Cancel] Found appointment #${apptInfo.id} for ${apptInfo.name} at ${apptInfo.start}`);
-
-    // ── Step 4: Click the appointment block in the calendar ─────────────────
-    // .calendar-event elements contain the appointment card. We match by client name.
     const clickedAppt = await page.evaluate(({ name }) => {
       for (const el of document.querySelectorAll('.calendar-event, .calendar-appointment')) {
         const txt = (el.innerText || '').toLowerCase();
@@ -963,16 +836,10 @@ app.post('/cancel-booking', async (req, res) => {
       }
       return false;
     }, { name: apptInfo.name });
-
-    if (!clickedAppt) {
-      throw new Error(`Could not click appointment for "${apptInfo.name}" in the calendar view`);
-    }
-
+    if (!clickedAppt) throw new Error(`Could not click appointment for "${apptInfo.name}" in the calendar view`);
     await page.waitForTimeout(2500);
     await screenshot(page, 'debug-cancel-step2-form.png');
     console.log('[Cancel] Appointment edit form opened');
-
-    // ── Step 5: Click "CANCEL APPOINTMENT" button ───────────────────────────
     const cancelBtnClicked = await page.evaluate(() => {
       for (const el of document.querySelectorAll('*')) {
         if ((el.innerText || '').trim() === 'CANCEL APPOINTMENT') {
@@ -982,16 +849,10 @@ app.post('/cancel-booking', async (req, res) => {
       }
       return false;
     });
-
-    if (!cancelBtnClicked) {
-      throw new Error('"CANCEL APPOINTMENT" button not found in the edit form');
-    }
-
+    if (!cancelBtnClicked) throw new Error('"CANCEL APPOINTMENT" button not found in the edit form');
     await page.waitForTimeout(1500);
     await screenshot(page, 'debug-cancel-step3-dialog.png');
     console.log('[Cancel] Cancellation dialog opened');
-
-    // ── Step 6: Click "CONFIRM CANCELLATION" ───────────────────────────────
     const confirmClicked = await page.evaluate(() => {
       for (const el of document.querySelectorAll('*')) {
         if ((el.innerText || '').trim() === 'CONFIRM CANCELLATION') {
@@ -1001,15 +862,10 @@ app.post('/cancel-booking', async (req, res) => {
       }
       return false;
     });
-
-    if (!confirmClicked) {
-      throw new Error('"CONFIRM CANCELLATION" button not found in the dialog');
-    }
-
+    if (!confirmClicked) throw new Error('"CONFIRM CANCELLATION" button not found in the dialog');
     await page.waitForTimeout(3000);
     await screenshot(page, 'debug-cancel.png');
     console.log('[Cancel] Cancellation confirmed!');
-
     res.json({ success: true, message: 'Appointment cancelled', details: { date, time, client: clientName } });
   } catch (err) {
     console.error('[Cancel] ERROR:', err.message);
@@ -1020,33 +876,19 @@ app.post('/cancel-booking', async (req, res) => {
   }
 });
 
-// ─── ENDPOINT 5: POST /reschedule-booking ────────────────────────────────────
-// Opens the existing appointment's edit form and changes the date + time,
-// then saves. Reuses the same date-picker and time-spinner logic as create-booking.
-//
-// Required body: { oldDate, oldTime, newDate, newTime, clientName }
-//   oldDate/oldTime – identify the appointment to move
-//   newDate/newTime – new date/time ("YYYY-MM-DD" / "H:MM AM/PM")
-//   clientName      – partial client name for matching
-
+// âââ ENDPOINT 5: POST /reschedule-booking ââââââââââââââââââââââââââââââââââââ
 app.post('/reschedule-booking', async (req, res) => {
-  const { oldDate, oldTime, newDate, newTime, clientName } = req.body;
-
+  const { oldDate: rawOldDate, oldTime, newDate: rawNewDate, newTime, clientName } = req.body;
+  const oldDate = (rawOldDate || '').replace(/^=/, '');
+  const newDate = (rawNewDate || '').replace(/^=/, '');
   if (!oldDate || !oldTime || !newDate || !newTime) {
-    return res.status(400).json({
-      success: false,
-      error: 'Missing required fields: oldDate, oldTime, newDate, newTime',
-    });
+    return res.status(400).json({ success: false, error: 'Missing required fields: oldDate, oldTime, newDate, newTime' });
   }
-
-  console.log(`\n[Reschedule] Moving ${clientName || 'appointment'} from ${oldDate} ${oldTime} → ${newDate} ${newTime}`);
+  console.log(`\n[Reschedule] Moving ${clientName || 'appointment'} from ${oldDate} ${oldTime} â ${newDate} ${newTime}`);
   let context, page;
-
   try {
     ({ page, context } = await newPage());
     await login(page);
-
-    // ── Step 1: Load calendar and navigate to oldDate ──────────────────────
     console.log('[Reschedule] Loading calendar...');
     const calApiDone = page.waitForResponse(
       r => r.url().includes('/api/2/calendar/') && r.status() === 200,
@@ -1055,12 +897,10 @@ app.post('/reschedule-booking', async (req, res) => {
     await page.goto(CALENDAR_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
     await calApiDone;
     await page.waitForTimeout(2000);
-
     const todayStr = new Date().toISOString().slice(0, 10);
     const msPerDay = 86400000;
     const toDays = (s) => { const [y,m,d] = s.split('-').map(Number); return Date.UTC(y,m-1,d) / msPerDay; };
     const daysDiff = Math.round(toDays(oldDate) - toDays(todayStr));
-
     if (daysDiff !== 0) {
       const arrowCls = daysDiff > 0 ? '.linearicon-chevron-right-circle' : '.linearicon-chevron-left-circle';
       for (let i = 0; i < Math.abs(daysDiff); i++) {
@@ -1074,8 +914,6 @@ app.post('/reschedule-booking', async (req, res) => {
     }
     await page.waitForTimeout(1500);
     console.log(`[Reschedule] On ${oldDate}`);
-
-    // ── Step 2: Find appointment via API ────────────────────────────────────
     const apptInfo = await page.evaluate(async ({ targetDate, clientNameQ, timeStr }) => {
       const resp = await fetch(`/api/2/calendar/?mode=day&exact_date=${targetDate}&format=json`, { credentials: 'include' });
       const data  = await resp.json();
@@ -1100,11 +938,8 @@ app.post('/reschedule-booking', async (req, res) => {
       }
       return null;
     }, { targetDate: oldDate, clientNameQ: clientName || '', timeStr: oldTime });
-
     if (!apptInfo) throw new Error(`No appointment found on ${oldDate} for "${clientName}" at ${oldTime}`);
     console.log(`[Reschedule] Found appointment #${apptInfo.id} for ${apptInfo.name}`);
-
-    // ── Step 3: Click the appointment in calendar to open edit form ─────────
     const clickedAppt = await page.evaluate(({ name }) => {
       for (const el of document.querySelectorAll('.calendar-event, .calendar-appointment')) {
         if ((el.innerText || '').toLowerCase().includes(name.toLowerCase())) {
@@ -1115,27 +950,21 @@ app.post('/reschedule-booking', async (req, res) => {
       }
       return false;
     }, { name: apptInfo.name });
-
     if (!clickedAppt) throw new Error(`Could not click appointment for "${apptInfo.name}" in calendar`);
     await page.waitForTimeout(2500);
     await screenshot(page, 'debug-reschedule-step1-form.png');
     console.log('[Reschedule] Edit form opened');
-
-    // ── Step 4: Change the date ─────────────────────────────────────────────
+    // ââ Change the date âââââââââââââââââââââââââââââââââââââââââââââââââââââ
     const targetDay = parseInt(newDate.split('-')[2], 10);
     console.log(`[Reschedule] Setting new date: ${newDate} (day ${targetDay})`);
-
     const dateInputPos = await page.evaluate(() => {
       const input = document.querySelector('input[placeholder*="Select a date"]');
       const r = input?.getBoundingClientRect();
       return r ? { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), bottom: Math.round(r.bottom) } : null;
     });
-
     if (dateInputPos) {
       await page.mouse.click(dateInputPos.x, dateInputPos.y);
       await page.waitForTimeout(1200);
-
-      // Navigate calendar months if needed then click target day
       for (let attempt = 0; attempt < 6; attempt++) {
         const dayClicked = await page.evaluate(({ day, inputBottom }) => {
           let pickerRoot = null;
@@ -1164,17 +993,12 @@ app.post('/reschedule-booking', async (req, res) => {
           }
           return null;
         }, { day: targetDay, inputBottom: dateInputPos.bottom });
-
-        if (dayClicked) {
-          console.log(`[Reschedule] Day ${targetDay} clicked at:`, JSON.stringify(dayClicked));
-          break;
-        }
-        // Navigate to next month
+        if (dayClicked) { console.log(`[Reschedule] Day ${targetDay} clicked at:`, JSON.stringify(dayClicked)); break; }
         const nextClicked = await page.evaluate(({ inputBottom }) => {
           for (const el of document.querySelectorAll('*')) {
             const txt = (el.innerText || '').trim();
             const r   = el.getBoundingClientRect();
-            if ((txt === '›' || txt === '>') && r.top > inputBottom - 30) { el.click(); return true; }
+            if ((txt === 'âº' || txt === '>') && r.top > inputBottom - 30) { el.click(); return true; }
           }
           return false;
         }, { inputBottom: dateInputPos.bottom });
@@ -1182,15 +1006,12 @@ app.post('/reschedule-booking', async (req, res) => {
         await page.waitForTimeout(500);
       }
       await page.waitForTimeout(1000);
-      // Close picker cleanly
       await page.keyboard.press('Escape');
       await page.waitForTimeout(400);
     }
-
     await screenshot(page, 'debug-reschedule-step2-date.png');
     console.log('[Reschedule] Date updated');
-
-    // ── Step 5: Change the time ─────────────────────────────────────────────
+    // ââ Change the time âââââââââââââââââââââââââââââââââââââââââââââââââââââ
     console.log(`[Reschedule] Setting new time: ${newTime}`);
     const timeMatch = newTime.match(/(\d{1,2}):(\d{2})\s?(AM|PM)/i);
     if (timeMatch) {
@@ -1200,8 +1021,7 @@ app.post('/reschedule-booking', async (req, res) => {
       const minOpts = [0, 15, 30, 45];
       const rounded = minOpts.reduce((a, b) => Math.abs(b - rawMin) < Math.abs(a - rawMin) ? b : a);
       const tMin = String(rounded).padStart(2, '0');
-      console.log(`[Reschedule] Parsed time → hour=${tHour}, min=${tMin}, ampm=${tAmpm}`);
-
+      console.log(`[Reschedule] Parsed time â hour=${tHour}, min=${tMin}, ampm=${tAmpm}`);
       const spinnerCoords = await page.evaluate(() => {
         const container = document.querySelector('[data-cs_field_name="start_time"]');
         if (!container) return [];
@@ -1224,22 +1044,18 @@ app.post('/reschedule-booking', async (req, res) => {
         }).filter(Boolean);
       });
       console.log('[Reschedule] Spinner coords:', JSON.stringify(spinnerCoords));
-
       if (spinnerCoords.length >= 3) {
         const [hourSpinner, minSpinner, ampmSpinner] = spinnerCoords;
-
         await page.mouse.click(hourSpinner.x, hourSpinner.y);
         await page.waitForTimeout(800);
         const hourOk = await selectDropdownValue(page, tHour, hourSpinner.y + 20, hourSpinner.x);
         console.log(`[Reschedule] Hour ${tHour}:`, hourOk);
         await page.waitForTimeout(500);
-
         await page.mouse.click(minSpinner.x, minSpinner.y);
         await page.waitForTimeout(800);
         const minOk = await selectDropdownValue(page, tMin, minSpinner.y + 20, minSpinner.x);
         console.log(`[Reschedule] Minute ${tMin}:`, minOk);
         await page.waitForTimeout(500);
-
         await page.mouse.click(ampmSpinner.x, ampmSpinner.y);
         await page.waitForTimeout(800);
         const ampmOk = await selectDropdownValue(page, tAmpm, ampmSpinner.y + 20, ampmSpinner.x);
@@ -1249,11 +1065,9 @@ app.post('/reschedule-booking', async (req, res) => {
         console.log('[Reschedule] WARNING: could not find all 3 spinners');
       }
     }
-
     await page.waitForTimeout(1000);
     await screenshot(page, 'debug-reschedule-step3-time.png');
-
-    // ── Step 6: Save & Close ────────────────────────────────────────────────
+    // ââ Save & Close ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     console.log('[Reschedule] Clicking SAVE & CLOSE...');
     const saveCoord = await page.evaluate(() => {
       for (const el of document.querySelectorAll('*')) {
@@ -1265,17 +1079,13 @@ app.post('/reschedule-booking', async (req, res) => {
       }
       return null;
     });
-
     if (saveCoord) {
       await page.mouse.click(saveCoord.x, saveCoord.y);
     } else {
       await page.locator('text=SAVE & CLOSE').last().click({ timeout: TIMEOUT });
     }
-
     await page.waitForTimeout(4000);
     await screenshot(page, 'debug-reschedule.png');
-
-    // Verify: form should be gone and no validation error
     const errorText = await page.evaluate(() => {
       for (const el of document.querySelectorAll('*')) {
         const txt = (el.innerText || '').trim();
@@ -1284,7 +1094,6 @@ app.post('/reschedule-booking', async (req, res) => {
       return null;
     });
     if (errorText) throw new Error(`Form validation error: ${errorText}`);
-
     console.log('[Reschedule] Rescheduled successfully!');
     res.json({
       success: true,
@@ -1300,10 +1109,13 @@ app.post('/reschedule-booking', async (req, res) => {
   }
 });
 
-// ─── Graceful Shutdown ────────────────────────────────────────────────────────
-
+// âââ Graceful Shutdown ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 process.on('SIGINT', async () => {
   console.log('\n[Server] Shutting down...');
+  if (availSession) {
+    await availSession.context.close().catch(() => {});
+    console.log('[Server] Availability session closed.');
+  }
   if (browserInstance) {
     await browserInstance.close().catch(() => {});
     console.log('[Server] Browser closed.');
@@ -1311,20 +1123,19 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-// ─── Start Server ─────────────────────────────────────────────────────────────
-
+// âââ Start Server âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 app.listen(PORT, () => {
   console.log('');
-  console.log('╔══════════════════════════════════════════════════╗');
-  console.log(`║  ClinicSense Automation Server                   ║`);
-  console.log(`║  Running at http://localhost:${PORT}               ║`);
-  console.log('╠══════════════════════════════════════════════════╣');
-  console.log('║  Endpoints:                                      ║');
-  console.log('║   GET  /health                                   ║');
-  console.log('║   POST /check-availability                       ║');
-  console.log('║   POST /create-booking                           ║');
-  console.log('║   POST /cancel-booking                           ║');
-  console.log('║   POST /reschedule-booking                       ║');
-  console.log('╚══════════════════════════════════════════════════╝');
+  console.log('ââââââââââââââââââââââââââââââââââââââââââââââââââââ');
+  console.log(`â  ClinicSense Automation Server                   â`);
+  console.log(`â  Running at http://localhost:${PORT}               â`);
+  console.log('â âââââââââââââââââââââââââââââââââââââââââââââââââââ£');
+  console.log('â  Endpoints:                                      â');
+  console.log('â   GET  /health                                   â');
+  console.log('â   POST /check-availability                       â');
+  console.log('â   POST /create-booking                           â');
+  console.log('â   POST /cancel-booking                           â');
+  console.log('â   POST /reschedule-booking                       â');
+  console.log('ââââââââââââââââââââââââââââââââââââââââââââââââââââ');
   console.log('');
 });
