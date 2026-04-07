@@ -14,7 +14,7 @@ const LOGIN_URL = 'https://clinicsense.com/login/';
 const CALENDAR_URL = 'https://clinicsense.com/dashboard/calendar/';
 const TIMEOUT = 30000;
 
-// ─── Browser Singleton ───────────────────────────────────────────────────────
+// --- Browser Singleton -------------------------------------------------------
 let browserInstance = null;
 async function getBrowser() {
   if (!browserInstance || !browserInstance.isConnected()) {
@@ -40,10 +40,10 @@ async function newPage() {
   return { page, context };
 }
 
-// ─── Availability Session Cache ───────────────────────────────────────────────
+// --- Availability Session Cache -----------------------------------------------
 // Keep ONE persistent logged-in Playwright context/page for /check-availability
 // so we don't pay the ~15-second login cost on every request.
-// Subsequent requests only need to navigate the calendar — saving ~20s per call.
+// Subsequent requests only need to navigate the calendar - saving ~20s per call.
 let availSession = null; // { context, page }
 
 async function getAvailabilityPage() {
@@ -58,7 +58,7 @@ async function getAvailabilityPage() {
     } catch (e) {
       console.log('[Session] Cached session check failed:', e.message);
     }
-    // Stale — close it
+    // Stale - close it
     await availSession.context.close().catch(() => {});
     availSession = null;
   }
@@ -78,7 +78,7 @@ async function getAvailabilityPage() {
   return page;
 }
 
-// ─── Login Helper ─────────────────────────────────────────────────────────────
+// --- Login Helper -------------------------------------------------------------
 async function login(page) {
   console.log('[Login] Navigating to login page...');
   await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
@@ -103,28 +103,28 @@ async function login(page) {
   const currentUrl = page.url();
   console.log(`[Login] Current URL after login: ${currentUrl}`);
   if (currentUrl.includes('/login')) {
-    throw new Error('Login failed — still on login page. Check credentials or network.');
+    throw new Error('Login failed - still on login page. Check credentials or network.');
   }
   console.log('[Login] Login successful!');
 }
 
-// ─── Screenshot Helper ────────────────────────────────────────────────────────
+// --- Screenshot Helper --------------------------------------------------------
 async function screenshot(page, filename) {
   const filepath = path.join(__dirname, filename);
   await page.screenshot({ path: filepath, fullPage: true });
   console.log(`[Screenshot] Saved: ${filepath}`);
 }
 
-// ─── ENDPOINT 1: GET /health ──────────────────────────────────────────────────
+// --- ENDPOINT 1: GET /health --------------------------------------------------
 app.get('/health', (req, res) => {
   console.log('[Health] Health check OK');
   res.json({ status: 'ok' });
 });
 
-// ─── ENDPOINT 2: POST /check-availability ────────────────────────────────────
+// --- ENDPOINT 2: POST /check-availability ------------------------------------
 app.post('/check-availability', async (req, res) => {
   // Strip leading '=' artifact that n8n injects when evaluating expressions
-  // e.g. n8n sends "=2026-03-31" → we strip to "2026-03-31"
+  // e.g. n8n sends "=2026-03-31" -> we strip to "2026-03-31"
   const date = (req.body.date || '').replace(/^=/, '');
 
   if (!date) {
@@ -147,7 +147,7 @@ app.post('/check-availability', async (req, res) => {
     await calReady;
     await page.waitForTimeout(1000); // short buffer for SPA rendering
 
-    // If redirected to login the session expired — invalidate & retry once
+    // If redirected to login the session expired - invalidate & retry once
     if (page.url().includes('/login')) {
       console.log('[Session] Session expired, re-authenticating...');
       await availSession.context.close().catch(() => {});
@@ -192,11 +192,11 @@ app.post('/check-availability', async (req, res) => {
       console.log('[Availability] Navigated to target date.');
     }
 
-    // Step 10: Parse all data from DOM — no API calls needed
+    // Step 10: Parse all data from DOM - no API calls needed
     console.log('[Availability] Parsing calendar DOM...');
     const calendarData = await page.evaluate(() => {
-      // ── A. Parse practitioner schedule from text header ──────────────────────
-      const UI_SKIP = /^(CALENDAR|CLIENTS|SELL|COMMUNICATION|REPORTS|SETUP|WAIT LIST|Location|Practitioners|Office staff|Services|Treatment|Form|Scheduling|Payment|Reminders|Notification|Auto|Change|Perks|Logout|TODAY|Switch|Print|Hide|ZOOM|LINK|Schedule|VIP|★)/i;
+      // -- A. Parse practitioner schedule from text header ----------------------
+      const UI_SKIP = /^(CALENDAR|CLIENTS|SELL|COMMUNICATION|REPORTS|SETUP|WAIT LIST|Location|Practitioners|Office staff|Services|Treatment|Form|Scheduling|Payment|Reminders|Notification|Auto|Change|Perks|Logout|TODAY|Switch|Print|Hide|ZOOM|LINK|Schedule|VIP|\u2605)/i;
       const bodyText = document.body.innerText;
       const headerSection = bodyText.split(/12AM\n12:15AM/)[0];
       const lines = headerSection.split('\n').map(l => l.trim()).filter(Boolean);
@@ -217,7 +217,7 @@ app.post('/check-availability', async (req, res) => {
           idx += 4;
         } else { idx++; }
       }
-      // ── B. Find each working practitioner's column x-position from the DOM ──
+      // -- B. Find each working practitioner's column x-position from the DOM --
       for (const prac of practitioners.filter(p => p.working)) {
         const nameNorm = prac.name.toUpperCase().replace(/\s+/g, ' ').trim();
         for (const el of document.querySelectorAll('*')) {
@@ -232,7 +232,7 @@ app.post('/check-availability', async (req, res) => {
           }
         }
       }
-      // ── C. Calibrate time grid: map pixel y-positions to clock times ─────────
+      // -- C. Calibrate time grid: map pixel y-positions to clock times ---------
       const timeLabels = [];
       for (const el of document.querySelectorAll('*')) {
         const txt = (el.innerText || '').trim();
@@ -257,7 +257,7 @@ app.post('/check-availability', async (req, res) => {
           refLabel = first;
         }
       }
-      // ── D. Parse booked appointment blocks from the calendar grid ────────────
+      // -- D. Parse booked appointment blocks from the calendar grid ------------
       const appointments = [];
       const eventEls = document.querySelectorAll(
         '.calendar-event, .calendar-appointment, [class*="calendar-event"], [class*="appt"], [class*="appointment"]'
@@ -306,7 +306,7 @@ app.post('/check-availability', async (req, res) => {
       `${calendarData.appointments.length} appointments found. ` +
       `pxPerMin=${calendarData.debug.pxPerMin?.toFixed(2)}, timeLabels=${calendarData.debug.timeLabelsCount}`);
 
-    // ── Time helpers ───────────────────────────────────────────────────────────
+    // -- Time helpers -----------------------------------------------------------
     const toMinutes = (timeStr) => {
       if (!timeStr) return null;
       timeStr = String(timeStr).trim();
@@ -329,7 +329,7 @@ app.post('/check-availability', async (req, res) => {
       return `${h12}:${String(m).padStart(2, '0')} ${ampm}`;
     };
 
-    // ── Step 11: Match appointments to practitioners by column x-position ──────
+    // -- Step 11: Match appointments to practitioners by column x-position ------
     const workingPractitioners = calendarData.practitioners.filter(p => p.working && p.start && p.end);
     console.log(`[Availability] Working practitioners: ${workingPractitioners.length}`);
     workingPractitioners.forEach(p => console.log(`  ${p.name} | ${p.start} - ${p.end} | colX=${p.colX}`));
@@ -349,7 +349,7 @@ app.post('/check-availability', async (req, res) => {
       }
     }
 
-    // ── Step 12: Build per-practitioner output ────────────────────────────────
+    // -- Step 12: Build per-practitioner output --------------------------------
     const practitionersOut = [];
     for (const prac of workingPractitioners) {
       const startMin  = toMinutes(prac.start);
@@ -397,10 +397,10 @@ app.post('/check-availability', async (req, res) => {
     if (page) await screenshot(page, 'debug-availability.png').catch(() => {});
     res.status(500).json({ success: false, error: err.message });
   }
-  // NOTE: Do NOT close the context here — we keep it alive for the next request.
+  // NOTE: Do NOT close the context here - we keep it alive for the next request.
 });
 
-// ─── ENDPOINT 3: POST /create-booking ────────────────────────────────────────
+// --- ENDPOINT 3: POST /create-booking ----------------------------------------
 // Helper: find visible element by exact innerText and return its center coord + bottom
 async function findVisibleByText(page, text) {
   return page.evaluate((t) => {
@@ -453,9 +453,9 @@ app.post('/create-booking', async (req, res) => {
   let context, page;
   try {
     ({ page, context } = await newPage());
-    // ── Step 1: Login ────────────────────────────────────────────────────────
+    // -- Step 1: Login --------------------------------------------------------
     await login(page);
-    // ── Step 2: Navigate to calendar and wait for SPA to load ────────────────
+    // -- Step 2: Navigate to calendar and wait for SPA to load ----------------
     console.log('[Booking] Navigating to calendar...');
     const calReady = page.waitForResponse(
       r => r.url().includes('/api/2/calendar/') && r.status() === 200,
@@ -464,7 +464,7 @@ app.post('/create-booking', async (req, res) => {
     await page.goto(CALENDAR_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT });
     await calReady;
     await page.waitForTimeout(2000);
-    // ── Step 3: Click the "+" FAB then "Schedule New Appointment" popup ───────
+    // -- Step 3: Click the "+" FAB then "Schedule New Appointment" popup -------
     console.log('[Booking] Opening new appointment form...');
     await page.waitForSelector('.linearicon-plus', { timeout: TIMEOUT });
     await page.click('.linearicon-plus');
@@ -478,7 +478,7 @@ app.post('/create-booking', async (req, res) => {
     await page.waitForTimeout(500);
     console.log('[Booking] New appointment form opened.');
     await screenshot(page, 'debug-booking-step1-form.png');
-    // ── Step 4: Client search ─────────────────────────────────────────────────
+    // -- Step 4: Client search -------------------------------------------------
     console.log(`[Booking] Searching for client: ${clientFirstName} ${clientLastName}`);
     const fullName = `${clientFirstName} ${clientLastName}`;
     await page.fill('input[placeholder*="Search for a client by name"]', fullName);
@@ -491,7 +491,7 @@ app.post('/create-booking', async (req, res) => {
       console.log('[Booking] Existing client selected.');
     } catch (_) {}
     if (!clientFound) {
-      console.log('[Booking] Client not found — adding new client...');
+      console.log('[Booking] Client not found - adding new client...');
       const addLink = await findVisibleByText(page, '+ Add new client');
       if (addLink) {
         await page.mouse.click(addLink.x, addLink.y);
@@ -520,7 +520,7 @@ app.post('/create-booking', async (req, res) => {
       }
     }
     await screenshot(page, 'debug-booking-step4-after-client.png');
-    // ── Step 5: Select service ────────────────────────────────────────────────
+    // -- Step 5: Select service ------------------------------------------------
     if (service) {
       console.log(`[Booking] Selecting service: ${service} (${duration || '60'} min)`);
       const svcDropdown = await findVisibleByText(page, 'Select service');
@@ -567,7 +567,7 @@ app.post('/create-booking', async (req, res) => {
         await screenshot(page, 'debug-booking-step5-after-service.png');
       }
     }
-    // ── Step 6: Select practitioner ───────────────────────────────────────────
+    // -- Step 6: Select practitioner -------------------------------------------
     if (therapist) {
       console.log(`[Booking] Selecting practitioner: ${therapist}`);
       const pracDropdown = await findVisibleByText(page, 'Select practitioner');
@@ -590,7 +590,7 @@ app.post('/create-booking', async (req, res) => {
         await screenshot(page, 'debug-booking-step6-after-prac.png');
       }
     }
-    // ── Step 7: Set date ──────────────────────────────────────────────────────
+    // -- Step 7: Set date ------------------------------------------------------
     console.log(`[Booking] Setting date to: ${date}`);
     const targetDay = parseInt(date.split('-')[2], 10);
     const dateInputPos = await page.evaluate(() => {
@@ -615,7 +615,7 @@ app.post('/create-booking', async (req, res) => {
                 if (ar.width > 100 && ar.height > 100) { pickerRoot = ancestor; break; }
                 ancestor = ancestor.parentElement;
               }
-      2       if (!pickerRoot) pickerRoot = el.parentElement;
+              if (!pickerRoot) pickerRoot = el.parentElement;
               break;
             }
           }
@@ -640,7 +640,7 @@ app.post('/create-booking', async (req, res) => {
           for (const el of document.querySelectorAll('*')) {
             const txt = (el.innerText || '').trim();
             const r = el.getBoundingClientRect();
-            if ((txt === '›' || txt === '>') && r.top > inputBottom - 30) { el.click(); return true; }
+            if ((txt === '>' || txt === '>') && r.top > inputBottom - 30) { el.click(); return true; }
           }
           return false;
         }, { inputBottom: dateInputPos.bottom });
@@ -652,7 +652,7 @@ app.post('/create-booking', async (req, res) => {
       await page.waitForTimeout(400);
     }
     await screenshot(page, 'debug-booking-step7-after-date.png');
-    // ── Step 8: Set start time ─────────────────────────────────────────────────
+    // -- Step 8: Set start time -------------------------------------------------
     console.log(`[Booking] Setting start time: ${time}`);
     const timeMatch = time.match(/(\d{1,2}):(\d{2})\s?(AM|PM)/i);
     if (timeMatch) {
@@ -662,7 +662,7 @@ app.post('/create-booking', async (req, res) => {
       const minOpts  = [0, 15, 30, 45];
       const rounded  = minOpts.reduce((a, b) => Math.abs(b - rawMin) < Math.abs(a - rawMin) ? b : a);
       const tMin     = String(rounded).padStart(2, '0');
-      console.log(`[Booking] Parsed time → hour=${tHour}, min=${tMin}, ampm=${tAmpm}`);
+      console.log(`[Booking] Parsed time -> hour=${tHour}, min=${tMin}, ampm=${tAmpm}`);
       const spinnerCoords = await page.evaluate(() => {
         const container = document.querySelector('[data-cs_field_name="start_time"]');
         if (!container) return [];
@@ -708,7 +708,7 @@ app.post('/create-booking', async (req, res) => {
     }
     await page.waitForTimeout(1000);
     await screenshot(page, 'debug-booking-step8-before-save.png');
-    // ── Step 9: Save & Close ──────────────────────────────────────────────────
+    // -- Step 9: Save & Close --------------------------------------------------
     console.log('[Booking] Clicking SAVE & CLOSE...');
     const saveCoord = await page.evaluate(() => {
       for (const el of document.querySelectorAll('*')) {
@@ -755,7 +755,7 @@ app.post('/create-booking', async (req, res) => {
   }
 });
 
-// ─── ENDPOINT 4: POST /cancel-booking ────────────────────────────────────────
+// --- ENDPOINT 4: POST /cancel-booking ----------------------------------------
 app.post('/cancel-booking', async (req, res) => {
   const { date: rawDate, time, clientName } = req.body;
   const date = (rawDate || '').replace(/^=/, '');
@@ -876,7 +876,7 @@ app.post('/cancel-booking', async (req, res) => {
   }
 });
 
-// ─── ENDPOINT 5: POST /reschedule-booking ────────────────────────────────────
+// --- ENDPOINT 5: POST /reschedule-booking ------------------------------------
 app.post('/reschedule-booking', async (req, res) => {
   const { oldDate: rawOldDate, oldTime, newDate: rawNewDate, newTime, clientName } = req.body;
   const oldDate = (rawOldDate || '').replace(/^=/, '');
@@ -884,7 +884,7 @@ app.post('/reschedule-booking', async (req, res) => {
   if (!oldDate || !oldTime || !newDate || !newTime) {
     return res.status(400).json({ success: false, error: 'Missing required fields: oldDate, oldTime, newDate, newTime' });
   }
-  console.log(`\n[Reschedule] Moving ${clientName || 'appointment'} from ${oldDate} ${oldTime} → ${newDate} ${newTime}`);
+  console.log(`\n[Reschedule] Moving ${clientName || 'appointment'} from ${oldDate} ${oldTime} -> ${newDate} ${newTime}`);
   let context, page;
   try {
     ({ page, context } = await newPage());
@@ -954,7 +954,7 @@ app.post('/reschedule-booking', async (req, res) => {
     await page.waitForTimeout(2500);
     await screenshot(page, 'debug-reschedule-step1-form.png');
     console.log('[Reschedule] Edit form opened');
-    // ── Change the date ─────────────────────────────────────────────────────
+    // -- Change the date -----------------------------------------------------
     const targetDay = parseInt(newDate.split('-')[2], 10);
     console.log(`[Reschedule] Setting new date: ${newDate} (day ${targetDay})`);
     const dateInputPos = await page.evaluate(() => {
@@ -998,7 +998,7 @@ app.post('/reschedule-booking', async (req, res) => {
           for (const el of document.querySelectorAll('*')) {
             const txt = (el.innerText || '').trim();
             const r   = el.getBoundingClientRect();
-            if ((txt === '›' || txt === '>') && r.top > inputBottom - 30) { el.click(); return true; }
+            if ((txt === '>' || txt === '>') && r.top > inputBottom - 30) { el.click(); return true; }
           }
           return false;
         }, { inputBottom: dateInputPos.bottom });
@@ -1011,7 +1011,7 @@ app.post('/reschedule-booking', async (req, res) => {
     }
     await screenshot(page, 'debug-reschedule-step2-date.png');
     console.log('[Reschedule] Date updated');
-    // ── Change the time ─────────────────────────────────────────────────────
+    // -- Change the time -----------------------------------------------------
     console.log(`[Reschedule] Setting new time: ${newTime}`);
     const timeMatch = newTime.match(/(\d{1,2}):(\d{2})\s?(AM|PM)/i);
     if (timeMatch) {
@@ -1021,7 +1021,7 @@ app.post('/reschedule-booking', async (req, res) => {
       const minOpts = [0, 15, 30, 45];
       const rounded = minOpts.reduce((a, b) => Math.abs(b - rawMin) < Math.abs(a - rawMin) ? b : a);
       const tMin = String(rounded).padStart(2, '0');
-      console.log(`[Reschedule] Parsed time → hour=${tHour}, min=${tMin}, ampm=${tAmpm}`);
+      console.log(`[Reschedule] Parsed time -> hour=${tHour}, min=${tMin}, ampm=${tAmpm}`);
       const spinnerCoords = await page.evaluate(() => {
         const container = document.querySelector('[data-cs_field_name="start_time"]');
         if (!container) return [];
@@ -1067,7 +1067,7 @@ app.post('/reschedule-booking', async (req, res) => {
     }
     await page.waitForTimeout(1000);
     await screenshot(page, 'debug-reschedule-step3-time.png');
-    // ── Save & Close ────────────────────────────────────────────────────────
+    // -- Save & Close --------------------------------------------------------
     console.log('[Reschedule] Clicking SAVE & CLOSE...');
     const saveCoord = await page.evaluate(() => {
       for (const el of document.querySelectorAll('*')) {
@@ -1109,7 +1109,7 @@ app.post('/reschedule-booking', async (req, res) => {
   }
 });
 
-// ─── Graceful Shutdown ────────────────────────────────────────────────────────
+// --- Graceful Shutdown --------------------------------------------------------
 process.on('SIGINT', async () => {
   console.log('\n[Server] Shutting down...');
   if (availSession) {
@@ -1123,19 +1123,19 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-// ─── Start Server ─────────────────────────────────────────────────────────────
+// --- Start Server -------------------------------------------------------------
 app.listen(PORT, () => {
   console.log('');
-  console.log('╔══════════════════════════════════════════════════╗');
-  console.log(`║  ClinicSense Automation Server                   ║`);
-  console.log(`║  Running at http://localhost:${PORT}               ║`);
-  console.log('╠══════════════════════════════════════════════════╣');
-  console.log('║  Endpoints:                                      ║');
-  console.log('║   GET  /health                                   ║');
-  console.log('║   POST /check-availability                       ║');
-  console.log('║   POST /create-booking                           ║');
-  console.log('║   POST /cancel-booking                           ║');
-  console.log('║   POST /reschedule-booking                       ║');
-  console.log('╚══════════════════════════════════════════════════╝');
+  console.log('+==================================================+');
+  console.log(`|  ClinicSense Automation Server                   |`);
+  console.log(`|  Running at http://localhost:${PORT}               |`);
+  console.log('+==================================================+');
+  console.log('|  Endpoints:                                      |');
+  console.log('|   GET  /health                                   |');
+  console.log('|   POST /check-availability                       |');
+  console.log('|   POST /create-booking                           |');
+  console.log('|   POST /cancel-booking                           |');
+  console.log('|   POST /reschedule-booking                       |');
+  console.log('+==================================================+');
   console.log('');
 });
