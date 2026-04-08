@@ -1,4 +1,4 @@
- require('dotenv').config();
+  require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { chromium } = require('playwright');
@@ -1152,7 +1152,7 @@ app.get('/update-gina-vapi', async (req, res) => {
   try {
     const assistants = await vapiReq('GET', '/assistant');
     if (!Array.isArray(assistants)) return res.json({ err: 'unexpected response', data: assistants });
-    const gina = assistants.find(a => (a.name || '').toLowerCase().includes('gina'));
+    const gina = assistants.find(a => /(gina|spa|receptionist)/i.test(a.name || '')) || assistants[0];
     if (!gina) return res.json({ err: 'Gina not found', names: assistants.map(a => a.name) });
     const msgs = (gina.model && gina.model.messages) ? gina.model.messages : [];
     const sysIdx = msgs.findIndex(m => m.role === 'system');
