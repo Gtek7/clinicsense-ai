@@ -1,4 +1,4 @@
-require('dotenv').config();
+ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { chromium } = require('playwright');
@@ -1124,6 +1124,64 @@ process.on('SIGINT', async () => {
 });
 
 // --- Start Server -------------------------------------------------------------
+// VAPI Gina Update Endpoint
+app.get('/update-gina-vapi', async (req, res) => {
+  const https = require('https');
+  const VAPI_KEY = 'd7069c8e-8704-40fe-98f0-0d6a11ed9bce';
+  function vapiReq(method, path, body) {
+    return new Promise((resolve, reject) => {
+      const data = body ? JSON.stringify(body) : null;
+      const opts = {
+        hostname: 'api.vapi.ai', port: 443, path: path, method: method,
+        headers: {
+          'Authorization': 'Bearer ' + VAPI_KEY,
+          'Content-Type': 'application/json',
+          'Content-Length': data ? Buffer.byteLength(data) : 0
+        }
+      };
+      const r = https.request(opts, resp => {
+        let buf = '';
+        resp.on('data', c => { buf += c; });
+        resp.on('end', () => { try { resolve(JSON.parse(buf)); } catch(e) { resolve({ raw: buf }); } });
+      });
+      r.on('error', reject);
+      if (data) r.write(data);
+      r.end();
+    });
+  }
+  try {
+    const assistants = await vapiReq('GET', '/assistant');
+    if (!Array.isArray(assistants)) return res.json({ err: 'unexpected response', data: assistants });
+    const gina = assistants.find(a => (a.name || '').toLowerCase().includes('gina'));
+    if (!gina) return res.json({ err: 'Gina not found', names: assistants.map(a => a.name) });
+    const msgs = (gina.model && gina.model.messages) ? gina.model.messages : [];
+    const sysIdx = msgs.findIndex(m => m.role === 'system');
+    const idx = sysIdx >= 0 ? sysIdx : 0;
+    const currentPrompt = (msgs[idx] && msgs[idx].content) ? msgs[idx].content : '';
+    if (req.query.read === '1') {
+      return res.json({ id: gina.id, name: gina.name, promptLen: currentPrompt.length, prompt: currentPrompt });
+    }
+    let p = currentPrompt;
+    p = p.replace(/\b30[\s-]?min(ute)?s?\b/gi, '60 minutes');
+    p = p.replace(/\b45[\s-]?min(ute)?s?\b/gi, '60 minutes');
+    p = p.replace(/\b75[\s-]?min(ute)?s?\b/gi, '90 minutes');
+    p = p.replace(/thai massage[^.]{0,200}?(floor|mat)[^.]*/gi, 'Thai massage is performed on a massage bed — a unique combination of stretching and massage. We do not do traditional floor-based Thai massage');
+    const extras = [];
+    if (!p.includes('60, 90') && !p.includes('60 minutes, 90')) extras.push('All massage services are available in 60, 90, and 120-minute durations, EXCEPT prenatal massage (90 and 120 minutes only) and pediatric massage.');
+    if (!p.toLowerCase().includes('filipino') && !p.toLowerCase().includes('tagalog')) extras.push('You can speak in Filipino or Tagalog if the caller prefers.');
+    if (!p.includes('one moment')) extras.push('When checking availability or processing information, say "one moment" instead of going silent. Never re-introduce yourself if the caller asks if you are still there.');
+    if (!p.includes('Good morning') && !p.includes('Good afternoon')) extras.push('Greet callers based on time of day: "Hi good morning/afternoon/evening, my name is Gina an AI receptionist of Hayahay massage. How can I help you?"');
+    if (!p.includes('prenatal') || (!p.includes('90 and 120') && !p.includes('90 minutes only'))) extras.push('Prenatal massage is available in 90 and 120 minutes only (no 60-minute option).');
+    if (extras.length > 0) p = p + '\n\n' + extras.join('\n');
+    if (req.query.preview === '1') return res.json({ beforeLen: currentPrompt.length, afterLen: p.length, newPrompt: p });
+    const newMsgs = msgs.map((m, i) => i === idx ? Object.assign({}, m, { content: p }) : m);
+    const payload = { model: Object.assign({}, gina.model, { messages: newMsgs }) };
+    const updated = await vapiReq('PATCH', '/assistant/' + gina.id, payload);
+    res.json({ success: !updated.err, id: gina.id, name: gina.name, beforeLen: currentPrompt.length, afterLen: p.length, vapiResponse: updated.id ? 'OK' : updated });
+  } catch(e) { res.json({ err: e.message, stack: e.stack ? e.stack.substring(0, 300) : '' }); }
+});
+
+
 app.listen(PORT, () => {
   console.log('');
   console.log('+==================================================+');
