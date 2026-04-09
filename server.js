@@ -1197,3 +1197,5 @@ app.listen(PORT, () => {
   console.log('+==================================================+');
   console.log('');
 });
+
+    if (!p.toLowerCase().includes('o means 0') && !p.toLowerCase().includes('"o" means')) extras.push('When a caller provides card numbers and says the letter "O", treat it as the number 0 (zero). For example, "four O two" means 402.');
