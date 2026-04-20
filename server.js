@@ -876,6 +876,74 @@ app.post('/cancel-booking', async (req, res) => {
   }
 });
 
+// --- ENDPOINT: POST /lookup-client-appointments ---
+// Looks up upcoming appointments by client name (next 14 days)
+app.post('/lookup-client-appointments', async (req, res) => {
+  const { clientName } = req.body;
+
+  if (!clientName) {
+    return res.status(400).json({ success: false, error: 'clientName is required' });
+  }
+
+  const clientNameQ = clientName.toLowerCase().trim();
+  let context, page;
+
+  try {
+    ({ context, page } = await newPage());
+    await login(page);
+
+    // Navigate to calendar to establish authenticated session
+    const calApiDone = page.waitForResponse(
+      url => url.url().includes('/api/2/calendar/') && url.status() === 200,
+      { timeout: 15000 }
+    );
+    await page.goto(CALENDAR_URL, { waitUntil: 'networkidle', timeout: 30000 });
+    await calApiDone;
+
+    // Scan next 14 days for appointments matching clientName
+    const allMatches = [];
+    for (let dayOffset = 0; dayOffset < 14; dayOffset++) {
+      const d = new Date();
+      d.setDate(d.getDate() + dayOffset);
+      const dateStr = d.toISOString().split('T')[0]; // YYYY-MM-DD
+
+      const dayAppts = await page.evaluate(async (date, nameQ) => {
+        try {
+          const resp = await fetch(
+            `/api/2/calendar/?mode=day&exact_date=${date}&format=json`,
+            { credentials: 'include' }
+          );
+          const data = await resp.json();
+          const appts = data.appointments || [];
+          return appts.filter(a =>
+            !nameQ || (a.client_name || '').toLowerCase().includes(nameQ)
+          );
+        } catch (e) {
+          return [];
+        }
+      }, dateStr, clientNameQ);
+
+      dayAppts.forEach(a => {
+        allMatches.push({
+          date: dateStr,
+          time: a.start_time,
+          clientName: a.client_name,
+          id: a.id
+        });
+      });
+    }
+
+    console.log(`[lookup-client-appointments] Found ${allMatches.length} appointments for "${clientName}"`);
+    res.json({ success: true, appointments: allMatches });
+
+  } catch (err) {
+    console.error('[lookup-client-appointments] Error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (context) await context.close();
+  }
+});
+
 // --- ENDPOINT 5: POST /reschedule-booking ------------------------------------
 app.post('/reschedule-booking', async (req, res) => {
   const { oldDate: rawOldDate, oldTime, newDate: rawNewDate, newTime, clientName } = req.body;
